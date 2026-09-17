@@ -97,8 +97,8 @@ class PuzzleAssistant:
         self.selector, self.worker = None, None
         self.cancel_event = threading.Event()
         self.events = queue.Queue()
-        self.preview_image, self._auto = None, False
-        self.status = tk.StringVar(value="按 F8 框选验证区域，F9 执行识别和拖动")
+        self.preview_image, self._auto_drag, self._select_only = None, False, False
+        self.status = tk.StringVar(value="F8 截图+识别，F9 识别+执行，F2 取消")
         self.details = tk.StringVar(value="所有图像识别在本机完成，不上传任何数据")
         self._build_ui()
         self.load_region()
@@ -113,6 +113,16 @@ class PuzzleAssistant:
         root.minsize(320, 420)
         root.attributes("-topmost", True)
         root.protocol("WM_DELETE_WINDOW", self.close)
+        try:
+            base = _project_dir()
+            icon_path = base / "icon16.png"
+            if not icon_path.exists() and getattr(sys, 'frozen', False):
+                icon_path = base / "_internal" / "icon16.png"
+            icon = ImageTk.PhotoImage(file=str(icon_path))
+            root.iconphoto(True, icon)
+            self._icon_ref = icon
+        except Exception:
+            pass
         root.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
         notebook = ttk.Notebook(root)
@@ -135,16 +145,26 @@ class PuzzleAssistant:
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.create_text(30, 35, anchor="nw", fill="#506078", font=("Microsoft YaHei UI", 13), text="按 F8 框选验证区域\n红框：拼图缺口\n绿点：鼠标按下位置\n红点：鼠标松开位置")
         actions = ttk.Frame(panel)
-        actions.grid(row=4, column=0, sticky="ew")
-        self.execute_button = ttk.Button(actions, text="执行(F9)", command=self.execute)
+        actions.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        row1 = ttk.Frame(actions)
+        row1.grid(row=0, column=0, sticky="ew")
+        row2 = ttk.Frame(actions)
+        row2.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.capture_button = ttk.Button(row1, text="截图", command=self._on_select)
+        self.capture_button.grid(row=0, column=0, padx=4)
+        self.recognize_button = ttk.Button(row1, text="识别", command=self.recognize)
+        self.recognize_button.grid(row=0, column=1, padx=4)
+        self.execute_button = ttk.Button(row2, text="执行", command=self.execute)
         self.execute_button.grid(row=0, column=0, padx=4)
-        ttk.Button(actions, text="取消(F2)", command=self.cancel).grid(row=0, column=1, padx=4)
-        self.save_button = ttk.Button(actions, text="保存诊断", command=self.save_debug)
-        self.save_button.grid(row=0, column=2, padx=4)
+        ttk.Button(row2, text="取消(F2)", command=self.cancel).grid(row=0, column=1, padx=4)
         log_panel.rowconfigure(0, weight=1)
         log_panel.columnconfigure(0, weight=1)
         self.log_widget = tk.Text(log_panel, wrap="word", state="disabled", font=("Microsoft YaHei UI", 10))
         self.log_widget.grid(row=0, column=0, sticky="nsew")
+        log_actions = ttk.Frame(log_panel)
+        log_actions.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+        self.save_button = ttk.Button(log_actions, text="保存诊断", command=self.save_debug)
+        self.save_button.grid(row=0, column=0)
         self.log_widget.tag_configure("error", foreground="#b42318")
         self.log_widget.tag_configure("info", foreground="#243751")
         self.desktop.clear_cancel_history()
@@ -191,7 +211,9 @@ class PuzzleAssistant:
 
     def set_buttons(self):
         busy = self.state in ("waiting", "selecting", "capturing", "dragging")
-        self.execute_button.configure(state="normal" if self.state == "ready" else "disabled")
+        self.capture_button.configure(state="normal" if self.state in ("idle", "ready") else "disabled")
+        self.recognize_button.configure(state="normal" if self.state in ("idle", "ready") else "disabled")
+        self.execute_button.configure(state="normal" if self.result else "disabled")
         self.save_button.configure(state="normal" if self.shot and not busy else "disabled")
 
     def later(self, delay, cb):
@@ -205,6 +227,16 @@ class PuzzleAssistant:
                     self.fail(str(exc))
         i = self.root.after(delay, guarded)
         self._pending.add(i)
+
+    def _on_select(self):
+        self._select_only = True
+        self._auto_drag = False
+        self.request_capture()
+
+    def recognize(self):
+        self._select_only = False
+        self._auto_drag = False
+        self.request_capture(False)
 
     def request_capture(self, reselect=True):
         if self.state not in ("idle", "ready") or self.closing:
@@ -241,6 +273,12 @@ class PuzzleAssistant:
         self.region = region
         self.save_region()
         self.step_hint.set("第二步：按 F9 一键完成")
+        if self._select_only:
+            self._select_only = False
+            self.state = "idle"
+            self.status.set(f"已保存选区 {region[0]},{region[1]}")
+            self.show()
+            return
         self.state = "capturing"
         self.later(200, self.capture)
 
@@ -259,9 +297,9 @@ class PuzzleAssistant:
         self.state = "ready"
         self.log(f"定位：{self.result.distance}px")
         self.draw()
-        if self._auto:
-            self._auto = False
-            self.execute()
+        if self._auto_drag:
+            self._auto_drag = False
+            self.later(20, self.execute)
             return
         self.status.set("已定位")
         self.show()
@@ -289,11 +327,7 @@ class PuzzleAssistant:
         self.details.set(f"移动{end[0] - start[0]}px")
 
     def execute(self):
-        if self.state == "idle" and self.region:
-            self._auto = True
-            self.request_capture(False)
-            return
-        if self.state != "ready" or not self.result:
+        if not self.result:
             return
         if time.monotonic() - self.captured_at > 20:
             self.fail("超时，重按F9")
@@ -353,11 +387,12 @@ class PuzzleAssistant:
         self.show()
 
     def fail(self, text):
-        self._auto = False
+        self._auto_drag = False
         self.result = None
         self.state = "idle"
         self.status.set(text)
         self.log(text, "error")
+        self.details.set("异常，请切换到「日志」页保存诊断截图")
         if not self.region:
             self.step_hint.set("第一步：按 F8 框选验证区域（仅首次）")
         self.show()
@@ -397,9 +432,11 @@ class PuzzleAssistant:
             else:
                 for a in actions:
                     if a == "select":
-                        self.request_capture()
+                        self._on_select()
+                        self._auto_drag = True
                     elif a == "execute":
-                        self.execute()
+                        self._auto_drag = True
+                        self.request_capture(False)
         try:
             ok, text = self.events.get_nowait()
         except queue.Empty:
