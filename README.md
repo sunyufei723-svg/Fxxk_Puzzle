@@ -14,6 +14,8 @@
 - Python 3.10+（源码运行时需要；打包成 exe 后不需要）
 - Chrome 或 Edge 浏览器
 
+## 用户版见右侧“Releases"
+
 ## 安装
 
 ### 1. 安装 Python 依赖
