@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+/dist/
+/build/
+*.spec
+/debug_last.png
+/region.json
+/region.json.tmp
+/Fxxk_Puzzle/
+/Fxxk_Puzzle.zip
+/debug_white_analysis.png
+/$regPath/
+/com.fxxk_puzzle.host.json
+tests/
