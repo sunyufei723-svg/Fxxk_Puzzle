@@ -1,0 +1,24 @@
+{
+  "schema": 2,
+  "window_mode": "maximized",
+  "chrome": {
+    "developer_mode": [
+      0.97936,
+      0.140655
+    ],
+    "load_unpacked": [
+      0.062951,
+      0.209056
+    ]
+  },
+  "edge": {
+    "developer_mode": [
+      0.180083,
+      0.922929
+    ],
+    "load_unpacked": [
+      0.615067,
+      0.292871
+    ]
+  }
+}

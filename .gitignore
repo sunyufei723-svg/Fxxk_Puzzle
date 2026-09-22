@@ -1,16 +1,29 @@
 __pycache__/
 *.py[cod]
 .venv/
-/dist/
-/build/
+
+# 构建输出（windows/ 与 mac/ 各自的 build/dist，以及根目录历史产物）
+build/
+dist/
 *.spec
-/debug_last.png
-/region.json
-/region.json.tmp
+
+# 运行时生成 / 用户数据（任意平台子目录均忽略）
+region.json
+region.json.tmp
+settings.json
+settings.json.tmp
+debug_last.png
+debug_white_analysis.png
+
+# 浏览器扩展原生消息宿主清单（含机器绝对路径）
+com.fxxk_puzzle.host.json
+
+# 打包分发物
 /Fxxk_Puzzle/
 /Fxxk_Puzzle.zip
-/debug_white_analysis.png
 /$regPath/
-/com.fxxk_puzzle.host.json
+*.app/
+*.dmg
+
 /RELEASE.md
 tests/

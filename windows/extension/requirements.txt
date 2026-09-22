@@ -1,0 +1,6 @@
+Pillow>=10.4,<13
+numpy>=1.26,<3
+opencv-python>=4.9,<5
+uiautomation>=2.0.29,<3
+pywin32>=306
+pyinstaller>=6,<7
