@@ -214,7 +214,7 @@ inline void RegisterUninstall(const fs::path& installDir, const fs::path& execut
           L"无法登记 Windows 卸载信息");
     const auto uninstaller = installDir / L"Uninstall.exe";
     SetRegistryString(key, L"DisplayName", L"拼图助手（Extension 版）");
-    SetRegistryString(key, L"DisplayVersion", L"2.1.0");
+    SetRegistryString(key, L"DisplayVersion", L"2.1.1");
     SetRegistryString(key, L"Publisher", L"Fxxk Puzzle");
     SetRegistryString(key, L"InstallLocation", installDir.wstring());
     SetRegistryString(key, L"DisplayIcon", executable.wstring());
@@ -533,29 +533,119 @@ inline HWND WaitFolderDialog(DWORD timeoutMs, const std::set<HWND>& preexisting)
     return nullptr;
 }
 
-// 把路径直接写进文件名框，确认写进去了再点接受按钮。
-// 实测 Ctrl+L 在 Windows 文件对话框里并不会聚焦文件名框（那是浏览器地址栏的习惯），
-// 于是一路 Ctrl+V 之后 Edit 仍然是空的；此时若点「选择文件夹」，选中的是当前浏览到的
-// 目录而不是扩展目录，Chrome 会因为找不到 manifest 而加载失败。
-inline bool AcceptFolderDialog(HWND dialog, const std::wstring& path) {
-    auto edit = FindWindowExW(dialog, nullptr, L"Edit", nullptr);
-    if (!edit) return false;
-    SetWindowTextW(edit, path.c_str());
-    wchar_t written[2048]{};
-    if (GetWindowTextW(edit, written, 2048) <= 0 || path != written) return false;
-    for (const wchar_t* label : {L"选择文件夹", L"Select", L"Select Folder", L"打开", L"确定", L"OK"}) {
+// 用 UIA 的 ValuePattern 写文件名框，而不是拿第一个 Edit 子窗口就认定它是文件名栏。
+// 后者在 Chrome/Edge 的「选择扩展程序目录」框里可能选中别的编辑框：SetWindowTextW 写进去、
+// GetWindowTextW 又原样读回来，看起来"校验通过"，于是「选择文件夹」被空文件名点掉，
+// 扩展没加载，安装器却以为成功了。ValuePattern 只认真正可写值的编辑框，且写完必须再读回来比对。
+// 按 AutomationId 精确查文件名输入框。
+// Edge 的「选择扩展目录」框在 UIA 里暴露 34 个 Edit，按遍历顺序第一个是列表列头
+// （Name='名称'，AutomationId='System.ItemNameDisplay'），对它 SetValue 会返回 0x80131505，
+// 而且逐个跨进程查询要 60 多秒。Chrome 的那个框 AutomationId 是 1152，标准文件对话框
+// 的文件名框是 1148，所以先定向查这两个，再退回按标签名匹配。
+inline ComPtr<IUIAutomationElement> FindEditById(IUIAutomation* automation,
+                                                 IUIAutomationElement* root,
+                                                 const wchar_t* automationId) {
+    VARIANT value{};
+    value.vt = VT_BSTR;
+    value.bstrVal = SysAllocString(automationId);
+    ComPtr<IUIAutomationCondition> condition;
+    ComPtr<IUIAutomationElement> found;
+    if (SUCCEEDED(automation->CreatePropertyCondition(UIA_AutomationIdPropertyId, value, &condition)) &&
+        condition) {
+        root->FindFirst(TreeScope_Subtree, condition.Get(), &found);
+    }
+    VariantClear(&value);
+    return found;
+}
+
+inline ComPtr<IUIAutomationElement> FindEditByName(IUIAutomation* automation,
+                                                   IUIAutomationElement* root,
+                                                   const std::vector<std::wstring>& names) {
+    for (const auto& name : names) {
+        if (auto found = FindNamedElement(automation, root, {name}, 1)) {
+            ComPtr<IUIAutomationValuePattern> value;
+            if (SUCCEEDED(found->GetCurrentPatternAs(UIA_ValuePatternId,
+                    __uuidof(IUIAutomationValuePattern), &value)) && value) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+inline bool TryValuePatternEdit(IUIAutomationElement* element, const std::wstring& path) {
+    if (!element) return false;
+    ComPtr<IUIAutomationValuePattern> value;
+    if (FAILED(element->GetCurrentPatternAs(UIA_ValuePatternId,
+            __uuidof(IUIAutomationValuePattern), &value)) || !value) return false;
+    BOOL readOnly = TRUE;
+    value->get_CurrentIsReadOnly(&readOnly);
+    if (readOnly) return false;
+    BSTR wanted = SysAllocString(path.c_str());
+    const HRESULT set = value->SetValue(wanted);
+    SysFreeString(wanted);
+    if (FAILED(set)) return false;
+    BSTR current = nullptr;
+    std::wstring written;
+    if (SUCCEEDED(value->get_CurrentValue(&current))) {
+        written = current ? current : L"";
+        SysFreeString(current);
+    }
+    return written == path;
+}
+
+inline bool FillFolderDialogValue(IUIAutomation* automation, HWND dialog, const std::wstring& path) {
+    ComPtr<IUIAutomationElement> root;
+    if (!automation || FAILED(automation->ElementFromHandle(dialog, &root)) || !root) return false;
+    for (const wchar_t* id : {L"1148", L"1152"}) {
+        auto element = FindEditById(automation, root.Get(), id);
+        if (element && TryValuePatternEdit(element.Get(), path)) return true;
+    }
+    auto element = FindEditByName(automation, root.Get(),
+        {L"文件名:", L"文件名", L"文件夹:", L"文件夹", L"File name:", L"File name",
+         L"File folder:", L"File folder"});
+    return element && TryValuePatternEdit(element.Get(), path);
+}
+
+// 只点真正存在的接受按钮；点不到就返回 false，绝不往"当前获得焦点的任何窗口"盲发回车。
+inline bool AcceptFolderDialogByButton(IUIAutomation* automation, HWND dialog,
+                                       const std::function<void(const std::wstring&)>& progress) {
+    for (const wchar_t* label : {L"选择文件夹", L"选择文件夹(&S)", L"Select", L"Select Folder",
+                                 L"Select Folder (&S)", L"打开", L"确定", L"OK"}) {
         if (auto accept = FindWindowExW(dialog, nullptr, L"Button", label)) {
             SendMessageW(accept, BM_CLICK, 0, 0);
+            progress(L"已点击文件对话框的「" + std::wstring(label) + L"」");
             return true;
         }
     }
-    SendVirtualKey(VK_RETURN, true);
-    SendVirtualKey(VK_RETURN, false);
-    return true;
+    ComPtr<IUIAutomation> owner = automation;
+    if (owner) {
+        ComPtr<IUIAutomationElement> root;
+        if (SUCCEEDED(owner->ElementFromHandle(dialog, &root)) && root) {
+            auto button = FindNamedElement(owner.Get(), root.Get(),
+                {L"选择文件夹", L"Select", L"Select Folder", L"打开", L"确定", L"OK"}, 1200);
+            if (button && ActivateUiaElement(button.Get(), false)) {
+                progress(L"已通过 UI Automation 点击文件对话框的接受按钮");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline bool AcceptFolderDialog(IUIAutomation* automation, HWND dialog, const std::wstring& path,
+                               const std::function<void(const std::wstring&)>& progress) {
+    if (!FillFolderDialogValue(automation, dialog, path)) {
+        progress(L"未能通过 UI Automation 写入扩展目录路径");
+        return false;
+    }
+    progress(L"扩展目录路径已写入文件对话框");
+    return AcceptFolderDialogByButton(automation, dialog, progress);
 }
 
 inline void ChooseExtensionFolder(IUIAutomation* automation, HWND dialog,
-                                  const fs::path& extensionDir) {
+                                  const fs::path& extensionDir,
+                                  const std::function<void(const std::wstring&)>& progress) {
     Check(dialog != nullptr, L"没有出现选择扩展文件夹的窗口");
     std::wstring path = extensionDir.wstring();
     // 安装目录是 "Programs/FxxkPuzzleExtension" 拼出来的，带正斜杠；文件对话框按
@@ -563,36 +653,35 @@ inline void ChooseExtensionFolder(IUIAutomation* automation, HWND dialog,
     std::replace(path.begin(), path.end(), L'/', L'\\');
     SetForegroundWindow(dialog);
 
-    if (AcceptFolderDialog(dialog, path)) {
-        for (int wait = 0; wait < 20 && FolderDialogAlive(dialog); ++wait)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    if (!FolderDialogAlive(dialog)) return;
+    Check(AcceptFolderDialog(automation, dialog, path, progress),
+          L"无法把扩展目录写入浏览器的文件夹选择窗口，扩展未加载。请在浏览器扩展页手动点"
+          L"「加载已解压的扩展程序」并选择 extensions 文件夹。");
+    for (int wait = 0; wait < 40 && FolderDialogAlive(dialog); ++wait)
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    Check(!FolderDialogAlive(dialog),
+          L"文件夹选择窗口仍未关闭，扩展可能尚未加载");
+}
 
-    // 兜底 1：剪贴板 + Ctrl+L/Ctrl+V/Enter
-    {
-        ClipboardGuard clipboard(path);
-        SendChord(VK_CONTROL, 'L');
-        SendChord(VK_CONTROL, 'V');
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        SendVirtualKey(VK_RETURN, true);
-        SendVirtualKey(VK_RETURN, false);
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+// 装完必须回读浏览器自己的扩展列表确认它真的在。v2.1.0 就是因为只看"对话框关掉了"
+// 就当成功，才把空文件名被接受的情况报成了安装完成。
+inline void VerifyExtensionLoaded(IUIAutomation* automation, HWND window,
+                                  const std::wstring& browser,
+                                  const std::wstring& extensionName,
+                                  const std::function<void(const std::wstring&)>& progress) {
+    progress(L"正在确认 " + browser + L" 是否真的加载了扩展……");
+    const auto deadline = GetTickCount64() + 12000;
+    while (GetTickCount64() < deadline) {
+        ComPtr<IUIAutomationElement> root;
+        if (SUCCEEDED(automation->ElementFromHandle(window, &root)) && root &&
+            FindNamedElement(automation, root.Get(), {extensionName}, 1)) {
+            progress(L"已确认「" + extensionName + L"」出现在 " + browser + L" 的扩展列表中");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
     }
-    // 粘贴 + 回车若已让对话框接受并关闭，必须立刻收手：再补一次回车会落到扩展页面上，
-    // 把"加载已解压的扩展程序"重新触发一遍。
-    if (!FolderDialogAlive(dialog)) return;
-
-    // 兜底 2：UIA 找接受按钮（覆盖按钮文字不在名单里的界面语言）
-    ComPtr<IUIAutomationElement> root;
-    automation->ElementFromHandle(dialog, &root);
-    auto button = root ? FindNamedElement(automation, root.Get(),
-        {L"选择文件夹", L"选择文件夹(&S)", L"Select", L"Select Folder", L"Select Folder (&S)",
-         L"打开", L"确定", L"OK"}, 1500)
-        : nullptr;
-    if (button) ActivateUiaElement(button.Get(), false);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    Check(!FolderDialogAlive(dialog), L"文件夹选择窗口仍未关闭，扩展可能尚未加载");
+    Check(false, L"「" + extensionName + L"」没有出现在 " + browser +
+                 L" 的扩展列表里，扩展未加载成功。请在扩展页手动点「加载已解压的扩展程序」，"
+                 L"选择 extensions 文件夹。");
 }
 
 inline void InstallBrowserExtension(
@@ -625,7 +714,8 @@ inline void InstallBrowserExtension(
                               points.load_x, points.load_y, progress),
           L"UI Automation 和备用坐标均无法操作“加载未打包的扩展”");
     ChooseExtensionFolder(automation.Get(),
-                          WaitFolderDialog(10000, preexistingDialogs), extensionDir);
+                          WaitFolderDialog(10000, preexistingDialogs), extensionDir, progress);
+    VerifyExtensionLoaded(automation.Get(), window, browser, L"拼图助手", progress);
 }
 
 inline void OpenTargetUrl(const fs::path& executable, const std::wstring& url) {

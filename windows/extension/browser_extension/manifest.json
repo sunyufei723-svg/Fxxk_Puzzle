@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "拼图助手",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "检测到目标网址时自动启动拼图程序",
   "permissions": ["tabs", "storage"],
   "action": {
