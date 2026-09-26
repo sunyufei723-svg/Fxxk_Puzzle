@@ -2,7 +2,6 @@
 #include "resource.h"
 
 #include <commctrl.h>
-#include <shellapi.h>
 #include <uxtheme.h>
 
 #include <memory>
@@ -30,6 +29,7 @@ constexpr COLORREF kPrimaryPressedColor = RGB(29, 78, 216);
 constexpr COLORREF kBorderColor = RGB(203, 213, 225);
 constexpr UINT WM_INSTALL_PROGRESS = WM_APP + 1;
 constexpr UINT WM_INSTALL_FINISHED = WM_APP + 2;
+constexpr wchar_t kSufeUrl[] = L"https://login.sufe.edu.cn/";
 
 enum ControlId {
     ID_NEXT = 1001,
@@ -51,16 +51,12 @@ enum class Page { Consent, Browser, Target, Hotkeys, Summary, Installing, Comple
 struct InstallResult {
     bool success = false;
     std::wstring message;
-    std::vector<std::wstring> installed;
 };
 
-std::wstring WideFromUtf8(const char* value) {
-    if (!value || !*value) return L"未知错误";
-    const int size = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
-    std::wstring result(static_cast<size_t>(size > 0 ? size : 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value, -1, result.data(), size);
-    if (!result.empty() && result.back() == L'\0') result.pop_back();
-    return result;
+std::wstring ExceptionMessage(const char* what) {
+    std::wstring text = native::WideFromUtf8(what);
+    if (text.empty()) text = L"未知错误";
+    return text;
 }
 
 class SetupWindow {
@@ -151,7 +147,6 @@ private:
                     MessageBoxW(window_, result->message.c_str(), L"安装未完成", MB_OK | MB_ICONERROR);
                     ShowSummary();
                 } else {
-                    installed_ = result->installed;
                     ShowComplete();
                 }
                 return 0;
@@ -179,12 +174,16 @@ private:
 
     HWND AddControl(const wchar_t* className, const std::wstring& text, DWORD style,
                     int x, int y, int width, int height, int id = 0) {
+        // 说明文字的 STATIC 矩形比它的实际文字高，会伸进内容区盖住下方控件的顶部边框。
+        // 修好它需要两件事同时成立：WS_CLIPSIBLINGS 让它重绘时不画到上层兄弟身上，
+        // 下面那次 SetWindowPos 让后创建的控件真正位于上层。缺任意一个都会露出缺口。
         HWND control = CreateWindowExW(
-            0, className, text.c_str(), WS_CHILD | WS_VISIBLE | style,
+            0, className, text.c_str(), WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | style,
             x, y, width, height, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
             instance_, nullptr);
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         SetWindowTheme(control, L"Explorer", nullptr);
+        SetWindowPos(control, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         controls_.push_back(control);
         return control;
     }
@@ -273,7 +272,9 @@ private:
     }
 
     void ShowTarget() {
-        BeginPage(Page::Target, L"选择目标网址", L"选择预设，或直接输入需要监测的网址。");
+        BeginPage(Page::Target, L"选择目标网址",
+                  L"已默认勾选「上财」并填好网址，确认无误即可直接下一步。\r\n"
+                  L"要监测其他页面：取消勾选后自行填写，或直接在下面修改。");
         sufeBox_ = AddControl(L"BUTTON", L"上财", BS_AUTOCHECKBOX | WS_TABSTOP,
                               48, 176, 180, 32, ID_SUFE);
         SendMessageW(sufeBox_, BM_SETCHECK, sufeSelected_ ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -370,8 +371,8 @@ private:
         }
         if (id == ID_SUFE && notification == BN_CLICKED) {
             sufeSelected_ = SendMessageW(sufeBox_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            if (sufeSelected_) SetWindowTextW(urlEdit_, L"https://login.sufe.edu.cn/");
-            else if (Text(urlEdit_) == L"https://login.sufe.edu.cn/") SetWindowTextW(urlEdit_, L"");
+            if (sufeSelected_) SetWindowTextW(urlEdit_, kSufeUrl);
+            else if (Text(urlEdit_) == kSufeUrl) SetWindowTextW(urlEdit_, L"");
             return;
         }
         if (id == ID_BACK) {
@@ -456,16 +457,14 @@ private:
                 if (chrome) {
                     native::InstallBrowserExtension(L"chrome", native::FindBrowser(L"chrome"),
                         destination / L"extensions", kChromePoints, progress);
-                    result->installed.push_back(L"chrome");
                 }
                 if (edge) {
                     native::InstallBrowserExtension(L"edge", native::FindBrowser(L"edge"),
                         destination / L"extensions", kEdgePoints, progress);
-                    result->installed.push_back(L"edge");
                 }
                 result->success = true;
             } catch (const std::exception& error) {
-                result->message = WideFromUtf8(error.what());
+                result->message = ExceptionMessage(error.what());
             } catch (...) {
                 result->message = L"发生未知安装错误";
             }
@@ -486,12 +485,11 @@ private:
     bool busy_ = false;
     bool chromeSelected_ = false;
     bool edgeSelected_ = false;
-    bool sufeSelected_ = false;
-    std::wstring targetUrl_;
+    bool sufeSelected_ = true;
+    std::wstring targetUrl_{kSufeUrl};
     std::wstring selectKey_ = L"F8";
     std::wstring executeKey_ = L"F9";
     std::wstring cancelKey_ = L"F2";
-    std::vector<std::wstring> installed_;
     HWND chromeBox_ = nullptr;
     HWND edgeBox_ = nullptr;
     HWND sufeBox_ = nullptr;
@@ -503,18 +501,6 @@ private:
     HWND instruction_ = nullptr;
 };
 
-bool HasArgument(const wchar_t* expected) {
-    int count = 0;
-    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (!arguments) return false;
-    bool found = false;
-    for (int index = 1; index < count; ++index) {
-        if (_wcsicmp(arguments[index], expected) == 0) found = true;
-    }
-    LocalFree(arguments);
-    return found;
-}
-
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
@@ -523,7 +509,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     InitCommonControlsEx(&controls);
     SetupWindow window(instance);
     if (!window.Create()) return 1;
-    if (HasArgument(L"--smoke-test")) SetTimer(window.Handle(), 1, 500, nullptr);
+    if (native::HasArgument(L"--smoke-test")) SetTimer(window.Handle(), 1, 500, nullptr);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);

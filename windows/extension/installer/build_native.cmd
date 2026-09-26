@@ -1,6 +1,16 @@
 @echo off
 setlocal
-set "VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+  echo Visual Studio locator not found. Install Visual Studio C++ Build Tools. 1>&2
+  exit /b 1
+)
+for /f "usebackq tokens=*" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
+if not defined VSROOT (
+  echo Visual Studio C++ Build Tools not found. 1>&2
+  exit /b 1
+)
+set "VSDEVCMD=%VSROOT%\Common7\Tools\VsDevCmd.bat"
 if not exist "%VSDEVCMD%" (
   echo Visual Studio C++ Build Tools not found. 1>&2
   exit /b 1

@@ -1,28 +1,37 @@
 """入口：框选区域、识别缺口、确认后单次拖动。"""
 
 import argparse
+import ctypes
 import json
 import queue
-import struct
-import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from PIL import Image, ImageTk, ImageGrab
+from PIL import ImageTk, ImageGrab
 
-from controls import (WindowsDesktop, perform_drag, enable_dpi_awareness, Hotkeys,
-                      DragCancelled, vk_for_function_key)
-from vision import detect, DetectionError
+from app.browser import TargetPageGuard, foreground_browser_info, target_from_launch_uri
+from app.controls import (WindowsDesktop, enable_dpi_awareness, Hotkeys,
+                          DragCancelled, vk_for_function_key)
+from app.vision import detect, DetectionError, white_ratio
 
 # 可自定义的运行参数（两个平台各自维护一份，互不共享）。
 FUNCTION_KEYS = [f"F{i}" for i in range(1, 13)]
+ACTIONS = ("select", "execute", "cancel")
+# 空闲态：只有这两个状态允许开始新一轮截图/识别，其余状态一律视为忙
+IDLE_STATES = ("idle", "ready")
 SPEED_MIN, SPEED_MAX, SPEED_STEP = 100, 3000, 50
 DEFAULT_SPEED = 600
 DEFAULT_HOTKEYS = {"select": "F8", "execute": "F9", "cancel": "F2"}
+
+
+def _valid_size(width, height):
+    """框选器接受的尺寸区间，与 load_region 恢复选区时的校验必须一致。"""
+    return 180 <= width <= 1600 and 140 <= height <= 1200
 
 
 class RegionSelector:
@@ -74,9 +83,7 @@ class RegionSelector:
         x2, y2 = self.position(event)
         left, right = sorted((x1, x2))
         top, bottom = sorted((y1, y2))
-        if right - left < 180 or bottom - top < 140:
-            return
-        if right - left > 1600 or bottom - top > 1200:
+        if not _valid_size(right - left, bottom - top):
             return
         ox, oy, _, _ = self.bounds
         self.complete((left + ox, top + oy, right + ox, bottom + oy))
@@ -93,11 +100,13 @@ class RegionSelector:
 
 
 class PuzzleAssistant:
-    def __init__(self, root, desktop, register_hotkeys=True, region_path=None):
+    def __init__(self, root, desktop, register_hotkeys=True, region_path=None,
+                 page_guard=None):
         self.root, self.desktop = root, desktop
         self.region_path = Path(region_path) if region_path else _project_dir() / "region.json"
         self.settings_path = _project_dir() / "settings.json"
         self.register_hotkeys = register_hotkeys
+        self.page_guard = page_guard
         self.drag_speed, self.hotkey_names = self._load_settings()
         self._apply_hotkey_config()
         self.hotkeys = self._make_hotkeys() if register_hotkeys else None
@@ -117,6 +126,15 @@ class PuzzleAssistant:
         self.log("程序已就绪，等待操作")
         self._poll_id = root.after(20, self.poll)
 
+    # ---- 配置读写：region.json 与 settings.json 都走同一套原子写 ----
+    def _write_json(self, path, data, error):
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            self.log(f"{error}：{exc}", "error")
+
     # ---- 设置：拖动速度 + 可改快捷键（持久化到 settings.json） ----
     def _load_settings(self):
         speed, hotkeys = DEFAULT_SPEED, dict(DEFAULT_HOTKEYS)
@@ -128,7 +146,7 @@ class PuzzleAssistant:
                     speed = s
                 hk = data.get("hotkeys")
                 if isinstance(hk, dict):
-                    for action in ("select", "execute", "cancel"):
+                    for action in ACTIONS:
                         v = hk.get(action)
                         if isinstance(v, str) and v in FUNCTION_KEYS:
                             hotkeys[action] = v
@@ -137,21 +155,15 @@ class PuzzleAssistant:
         return speed, hotkeys
 
     def _save_settings(self):
-        data = {"drag_speed": int(self.drag_speed), "hotkeys": dict(self.hotkey_names)}
-        try:
-            tmp = self.settings_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp.replace(self.settings_path)
-        except OSError as exc:
-            self.log(f"设置保存失败：{exc}", "error")
+        data = {"drag_speed": self.drag_speed, "hotkeys": dict(self.hotkey_names)}
+        self._write_json(self.settings_path, data, "设置保存失败")
 
     def _apply_hotkey_config(self):
         self.select_vk = vk_for_function_key(self.hotkey_names["select"])
         self.desktop.cancel_vk = vk_for_function_key(self.hotkey_names["cancel"])
 
     def _make_hotkeys(self):
-        keys = [(vk_for_function_key(self.hotkey_names[a]), a)
-                for a in ("select", "execute", "cancel")]
+        keys = [(vk_for_function_key(self.hotkey_names[a]), a) for a in ACTIONS]
         return Hotkeys(self.desktop, keys)
 
     def _rebuild_hotkeys(self):
@@ -200,7 +212,7 @@ class PuzzleAssistant:
             pass
 
     def _on_speed(self, value):
-        stepped = int(round(float(value) / SPEED_STEP)) * SPEED_STEP
+        stepped = round(float(value) / SPEED_STEP) * SPEED_STEP
         self.drag_speed = min(SPEED_MAX, max(SPEED_MIN, stepped))
         self.speed_value.set(f"{self.drag_speed} px/s")
 
@@ -208,7 +220,7 @@ class PuzzleAssistant:
         name = combobox.get()
         if name == self.hotkey_names[action]:
             return
-        for other, (var, _cb) in self.hotkey_vars.items():
+        for other in self.hotkey_vars:
             if other != action and self.hotkey_names[other] == name:
                 combobox.set(self.hotkey_names[action])
                 self.log(f"{name} 已被「{other}」占用，未修改", "error")
@@ -232,9 +244,9 @@ class PuzzleAssistant:
             icon_path = base / "icon16.png"
             if not icon_path.exists() and getattr(sys, 'frozen', False):
                 icon_path = base / "_internal" / "icon16.png"
-            icon = ImageTk.PhotoImage(file=str(icon_path))
-            root.iconphoto(True, icon)
-            self._icon_ref = icon
+            # PhotoImage 必须挂在 self 上：被 GC 后 Tk 会连带删掉图标
+            self._icon_ref = ImageTk.PhotoImage(file=str(icon_path))
+            root.iconphoto(True, self._icon_ref)
         except Exception:
             pass
         root.rowconfigure(0, weight=1)
@@ -300,7 +312,7 @@ class PuzzleAssistant:
             if any(not isinstance(p, list) or len(p) != 2 or any(type(v) is not int for v in p) for p in corners):
                 raise ValueError("坐标无效")
             (l, t), (r, b) = corners
-            if not (180 <= r - l <= 1600 and 140 <= b - t <= 1200):
+            if not _valid_size(r - l, b - t):
                 raise ValueError("尺寸无效")
             x, y, w, h = self.desktop.bounds()
             if not (x <= l < r <= x + w and y <= t < b <= y + h):
@@ -318,19 +330,14 @@ class PuzzleAssistant:
         if not self.region:
             return
         data = {"top_left": list(self.region[:2]), "bottom_right": list(self.region[2:])}
-        try:
-            tmp = self.region_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp.replace(self.region_path)
-        except OSError as exc:
-            self.log(f"保存失败：{exc}", "error")
+        self._write_json(self.region_path, data, "保存失败")
 
     def set_buttons(self):
-        busy = self.state in ("waiting", "selecting", "capturing", "dragging")
-        self.capture_button.configure(state="normal" if self.state in ("idle", "ready") else "disabled")
-        self.recognize_button.configure(state="normal" if self.state in ("idle", "ready") else "disabled")
+        idle = self.state in IDLE_STATES
+        self.capture_button.configure(state="normal" if idle else "disabled")
+        self.recognize_button.configure(state="normal" if idle else "disabled")
         self.execute_button.configure(state="normal" if self.result else "disabled")
-        self.save_button.configure(state="normal" if self.shot and not busy else "disabled")
+        self.save_button.configure(state="normal" if self.shot and idle else "disabled")
 
     def _build_settings_tab(self, notebook):
         panel = ttk.Frame(notebook, padding=12)
@@ -348,11 +355,12 @@ class PuzzleAssistant:
         self.hotkey_vars = {}
         for i, (action, label) in enumerate(rows):
             ttk.Label(panel, text=f"{label} 快捷键").grid(row=i + 1, column=0, sticky="w", pady=4)
+            # StringVar 必须挂在 self 上：被 GC 时 tkinter 会连带 unset，下拉框就空了
             var = tk.StringVar(value=self.hotkey_names[action])
             cb = ttk.Combobox(panel, textvariable=var, values=FUNCTION_KEYS, state="readonly", width=8)
             cb.grid(row=i + 1, column=1, sticky="w", pady=4)
             cb.bind("<<ComboboxSelected>>", lambda e, a=action, c=cb: self._on_hotkey(a, c))
-            self.hotkey_vars[action] = (var, cb)
+            self.hotkey_vars[action] = var
         ttk.Label(panel, text="快捷键仅支持 F1~F12；改后立即生效并自动保存。",
                   foreground="#506078").grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
@@ -379,7 +387,7 @@ class PuzzleAssistant:
         self.request_capture(False)
 
     def request_capture(self, reselect=True):
-        if self.state not in ("idle", "ready") or self.closing:
+        if self.closing or self.state not in IDLE_STATES:
             return
         if not reselect and not self.region:
             return
@@ -413,7 +421,8 @@ class PuzzleAssistant:
         self.region = region
         self.save_region()
         self._set_hint(self._hint2())
-        if self._select_only:
+        # getattr 兜底同 _key：单测用 __new__ 构造的实例没有 _select_only
+        if getattr(self, "_select_only", False):
             self._select_only = False
             self.state = "idle"
             self.status.set(f"已保存选区 {region[0]},{region[1]}")
@@ -447,7 +456,7 @@ class PuzzleAssistant:
     def draw(self):
         if not self.shot:
             return
-        self.preview_image = ImageTk.PhotoImage(self.shot)
+        self.preview_image = ImageTk.PhotoImage(self.shot, master=self.canvas)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.preview_image)
         self.canvas.configure(scrollregion=(0, 0, self.shot.width, self.shot.height))
@@ -496,9 +505,8 @@ class PuzzleAssistant:
                 w1, w2 = self.desktop.root_window(pts[0]), self.desktop.root_window(pts[1])
                 if not w1 or w1 != w2:
                     raise DetectionError("起终点不在同一窗口")
-                from controls import perform_drag
-                from PIL import ImageGrab
-                from vision import white_ratio
+                # 延迟导入：让 patch("app.controls.perform_drag") 能拦到这里
+                from app.controls import perform_drag
                 perform_drag(self.desktop, pts[0], pts[1], self.cancel_event,
                              gap_screen_rect=gap_screen, grab_region=region,
                              grab=ImageGrab.grab, white_ratio=white_ratio,
@@ -512,7 +520,7 @@ class PuzzleAssistant:
     def cancel(self):
         self.gen += 1
         self.cancel_event.set()
-        self._auto = False
+        self._auto_drag = False
         self.result = None
         if self.selector:
             s, self.selector = self.selector, None
@@ -557,7 +565,12 @@ class PuzzleAssistant:
             self.fail(f"保存失败：{exc}")
 
     def poll(self):
+        # 当前回调已经开始执行，不能再把它当作待取消的 after 任务。
+        self._poll_id = None
         if self.closing:
+            return
+        if self.page_guard and self.page_guard.should_close():
+            self.close()
             return
         if self.hotkeys:
             try:
@@ -620,22 +633,59 @@ def _project_dir():
     return Path(sys.executable if getattr(sys, 'frozen', False) else __file__).parent
 
 
+def _acquire_single_instance():
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.GetLastError.restype = wintypes.DWORD
+    handle = kernel32.CreateMutexW(None, False, "Local\\FxxkPuzzleExtension")
+    if not handle:
+        raise ctypes.WinError()
+    if kernel32.GetLastError() == 183:
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
 def main():
-    parser = argparse.ArgumentParser(description="\u767d\u8272\u62fc\u56fe\u9a8c\u8bc1\u7684\u672c\u5730\u8f85\u52a9\u5de5\u5177")
-    parser.add_argument("--smoke-test", action="store_true", help="\u4ec5\u542f\u52a8\u754c\u9762\u540e\u9000\u51fa\uff0c\u4e0d\u622a\u5c4f\u3001\u4e0d\u64cd\u4f5c\u9f20\u6807")
+    parser = argparse.ArgumentParser(description="白色拼图验证的本地辅助工具")
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="仅启动界面后退出，不截屏、不操作鼠标")
+    parser.add_argument("launch_uri", nargs="?")
     args, _ = parser.parse_known_args()
-    enable_dpi_awareness()
-    root = tk.Tk()
+    instance = _acquire_single_instance()
+    if instance is None:
+        return 0
     try:
-        app = PuzzleAssistant(root, WindowsDesktop(), register_hotkeys=not args.smoke_test)
-    except Exception as exc:
-        messagebox.showerror("\u542f\u52a8\u5931\u8d25", str(exc), parent=root)
-        root.destroy()
-        return 1
-    if args.smoke_test:
-        root.after(400, app.close)
-    root.mainloop()
-    return 0
+        target_url = target_from_launch_uri(args.launch_uri)
+        page_guard = None
+        if target_url:
+            # 记录启动它的浏览器窗口，用于离开目标页后自动退出
+            browser_info = foreground_browser_info()
+            page_guard = TargetPageGuard(target_url, browser_info[0] if browser_info else None)
+        enable_dpi_awareness()
+        root = tk.Tk()
+        try:
+            app = PuzzleAssistant(
+                root,
+                WindowsDesktop(),
+                register_hotkeys=not args.smoke_test,
+                page_guard=page_guard,
+            )
+        except Exception as exc:
+            messagebox.showerror("启动失败", str(exc), parent=root)
+            root.destroy()
+            return 1
+        if not args.smoke_test and app.region:
+            # 有选区文件就不必再点一次「识别」：启动即自动截图定位一次。
+            # 「识别」按钮保留，用于换题或这次没定位到时重来。
+            app.recognize()
+        if args.smoke_test:
+            root.after(400, app.close)
+        root.mainloop()
+        return 0
+    finally:
+        ctypes.windll.kernel32.CloseHandle(instance)
 
 
 if __name__ == "__main__":

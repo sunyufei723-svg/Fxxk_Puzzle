@@ -9,12 +9,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         const config = await response.json();
         targetUrl = config.targetUrl || "";
         if (targetUrl) await chrome.storage.local.set({ targetUrl });
-      } catch (error) {
+      } catch {
         status.textContent = "未读取到安装配置";
       }
     }
-    if (targetUrl) urlInput.value = targetUrl;
     if (targetUrl) {
+      urlInput.value = targetUrl;
       status.textContent = "已配置";
       status.style.color = "#16a34a";
     }

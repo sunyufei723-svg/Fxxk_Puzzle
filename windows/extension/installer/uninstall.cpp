@@ -1,10 +1,6 @@
 #include "native_support.hpp"
 #include "resource.h"
 
-#include <shellapi.h>
-
-#include <sstream>
-
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -12,20 +8,6 @@
 namespace {
 
 namespace fs = std::filesystem;
-
-constexpr wchar_t kDisplayName[] = L"拼图助手（Extension 版）";
-
-bool HasArgument(const wchar_t* expected) {
-    int count = 0;
-    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (!arguments) return false;
-    bool found = false;
-    for (int index = 1; index < count; ++index) {
-        if (_wcsicmp(arguments[index], expected) == 0) found = true;
-    }
-    LocalFree(arguments);
-    return found;
-}
 
 fs::path CurrentExecutable() {
     std::wstring buffer(32768, L'\0');
@@ -131,9 +113,9 @@ void RelayToTemporaryCopy(bool quiet) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-    if (HasArgument(L"--smoke-test")) return 0;
-    const bool quiet = HasArgument(L"--quiet");
-    const bool remove = HasArgument(L"--remove");
+    if (native::HasArgument(L"--smoke-test")) return 0;
+    const bool quiet = native::HasArgument(L"--quiet");
+    const bool remove = native::HasArgument(L"--remove");
     try {
         if (!remove) {
             RelayToTemporaryCopy(quiet);

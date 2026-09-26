@@ -1,0 +1,8 @@
+#include "resource.h"
+
+IDI_APP_ICON ICON "..\\assets\\icon.ico"
+
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+// 没有这段声明时进程加载 comctl32 v5：复选框退回经典灰方块，SetWindowTheme 全部失效，
+// 且非 DPI 感知的窗口会被整窗位图拉伸而发虚。Setup 与 Uninstall 共用本资源文件。
+1 24 "app.manifest"

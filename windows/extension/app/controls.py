@@ -14,8 +14,8 @@ class DragCancelled(RuntimeError):
 
 def perform_drag(mouse, start, end, cancel, gap_screen_rect=None,
                  grab_region=None, grab=None, white_ratio=None,
-                 speed=600, white_threshold=.008, max_checks=25, settle_delay=.12):
-    """拖动 + 白像素反馈循环：占比低于阈值才释放鼠标。"""
+                 speed=600, max_checks=60, max_reads=10, settle_delay=.12):
+    """拖动 + 白像素反馈：粗略落点后一次一步下山，停在白色比例谷底再松手。"""
     def check():
         if cancel.is_set() or mouse.cancel_pressed():
             raise DragCancelled("已取消，鼠标已释放。")
@@ -60,40 +60,90 @@ def perform_drag(mouse, start, end, cancel, gap_screen_rect=None,
             wait(.01)
         wait(settle_delay)
 
-        # 反馈循环：用白像素比例的变化趋势决定方向。
+        # 反馈循环：粗略落点（箭头中心→缺口中心）只是起点，绝不在这里松手。
+        # 白色比例越低说明拼块盖得越严，所以一次只挪一步下山：
+        #   更小 → 同方向继续；向右挪变大 → 掉头向左；向左也变大 → 谷底就在右边一步，
+        #   退回最优点松手；不变 → 没有信息，保持方向并把步长翻倍（见下）。
+        # 粗略位移既可能偏小（拼块在照片最左、箭头在滑轨左侧）也可能偏大，两个方向都得能纠。
+        # 判据用严格比较，不设任何经验阈值：比例是同一块像素的白色占比，同一帧两次结果
+        # 逐位相同，加死区只会把真实的小幅改进当成噪声。
         if gap_screen_rect is None or grab is None or white_ratio is None:
             return
-        current_x = end[0]
-        prev_ratio = None
-        going_right = True
-        # 步长：缺口宽度的 2%，最大 5px，避免来回震荡
-        step = min(5, max(1, int(round((gap_screen_rect[2] - gap_screen_rect[0]) * .02))))
-        for attempt in range(max_checks):
-            check()
+        gap_width = gap_screen_rect[2] - gap_screen_rect[0]
+        # 细步长：缺口宽度的 4%，2~5px。每步都要等画面停住，步长太细就把时间全花在
+        # 等待上；2px 相对拼块宽度仍然远小于网站允许的误差。
+        probe_step = min(5, max(2, round(gap_width * .04)))
+        stride_cap = probe_step * 4          # 跨平台时最多放大到 4 倍，别一步步地爬
+        left_limit = start[0]                # 滑块已在轨道最左，再向左探没有意义
+        right_limit = grab_region[2] - 5     # 不得探测到截图右边界之外
+        # 缺口矩形换算成截图内坐标，才能和截屏一起交给 white_ratio
+        local_rect = (gap_screen_rect[0] - grab_region[0],
+                      gap_screen_rect[1] - grab_region[1],
+                      gap_screen_rect[2] - grab_region[0],
+                      gap_screen_rect[3] - grab_region[1])
+
+        def measure():
             try:
-                current = grab(bbox=grab_region, all_screens=True)
+                frame = grab(bbox=grab_region, all_screens=True)
             except Exception:
+                return None
+            return white_ratio(frame, local_rect)
+
+        def probe(x):
+            """移动到 x，等画面停住再读数：每 40ms 重读一次，直到连续两次读数相同，
+            且至少读满 4 轮。
+            页面重绘比指针慢时，刚挪完截到的是上一处的旧画面。只等"连续两次相同"不够——
+            旧画面自己也是连续两次相同的，必须给页面留出重绘时间，否则下降段旧值会被当成
+            "改进"（最优点记到真实谷底右边一步），平台段旧值会被当成"不变"（当场松手）。"""
+            mouse.move(x, end[1])
+            previous = None
+            for round_ in range(1, max_reads + 1):
+                wait(.04)
+                current = measure()
+                if current is None:
+                    return None
+                if current == previous and round_ >= 4:
+                    return current
+                previous = current
+            return previous                 # 读满上限仍在变（页面有动画），用最后一次读数
+
+        x = best_x = end[0]
+        best_ratio = probe(x)
+        if best_ratio is None:
+            return
+        direction, stride, stalled, flat = 1, probe_step, 0, 0
+        for _ in range(max_checks):
+            check()
+            x += direction * stride
+            if x < left_limit or x > right_limit:
                 break
-            local_rect = (
-                gap_screen_rect[0] - grab_region[0],
-                gap_screen_rect[1] - grab_region[1],
-                gap_screen_rect[2] - grab_region[0],
-                gap_screen_rect[3] - grab_region[1],
-            )
-            ratio = white_ratio(current, local_rect)
-            if ratio < white_threshold:
-                return
-            if prev_ratio is not None:
-                if ratio > prev_ratio:
-                    going_right = not going_right
-            direction = 1 if going_right else -1
-            prev_ratio = ratio
-            new_x = current_x + step * direction
-            if not (start[0] < new_x < grab_region[2] - 5):
+            ratio = probe(x)
+            if ratio is None:
                 break
-            mouse.move(new_x, end[1])
-            current_x = new_x
-            wait(.08)
+            if ratio < best_ratio:
+                best_x, best_ratio, stride, stalled, flat = x, ratio, probe_step, 0, 0
+            elif ratio > best_ratio:
+                if direction < 0:
+                    break                            # 向左也变大：谷底在右边一步
+                # 向右变大：掉头向左，起点退回最优点。不去重测已知的位置，否则必然读出
+                # 一个"不变"，把下面的加速误触发，一步跨过真正的谷底。
+                direction, stride, x, stalled, flat = -1, probe_step, best_x, 0, 0
+            else:
+                # 不变有两种成因，都不是"已经对齐"：拼块还没压到缺口上（错位超过一个
+                # 拼块宽度时比例逐位相同），或者站点把拼块位置量化得比 1px 还粗，指针
+                # 挪了画面没动。两种都只是"没有信息"，所以保持方向继续走。
+                # 但加速要等连续两次不变——单次不变也可能只是一次没等到重绘的旧读数，
+                # 就放大步长会让采样网格跨过谷底。
+                flat += 1
+                stalled += stride
+                if flat >= 2:
+                    stride = min(stride * 2, stride_cap)
+                # 连着走了一个缺口宽度仍毫无变化，说明这个方向不会有信息，别烧探测预算。
+                if stalled >= gap_width:
+                    break
+        if x != best_x:
+            mouse.move(best_x, end[1])           # 退回观测到的谷底再松手
+            wait(.05)
     finally:
         if attempted_press:
             mouse.release()
@@ -184,12 +234,14 @@ class WindowsDesktop:
         self.cancel_vk = 0x71
 
     def bounds(self):
+        # 76~79 = SM_X/YVIRTUALSCREEN + SM_CX/CYVIRTUALSCREEN：多屏合并后的虚拟桌面包围盒
         return tuple(self.api.GetSystemMetrics(index) for index in (76, 77, 78, 79))
 
     def key_down(self, key):
         return bool(self.api.GetAsyncKeyState(key) & 0x8000)
 
     def cancel_pressed(self):
+        # 0x8001：当前按下或自上次查询后被按下过，取消键快速点按也不会漏
         return bool(self.api.GetAsyncKeyState(self.cancel_vk) & 0x8001)
 
     def clear_cancel_history(self):
@@ -223,12 +275,14 @@ class WindowsDesktop:
                 self._pressed = False
 
     def root_window(self, point):
+        # 2 = GA_ROOT：从子控件回溯到顶层窗口，用于校验起终点同属一个窗口
         hwnd = self.api.WindowFromPoint(wintypes.POINT(*point))
         return self.api.GetAncestor(hwnd, 2) if hwnd else 0
 
     def place(self, widget, x, y, width, height):
         widget.update_idletasks()
         hwnd = self.api.GetAncestor(widget.winfo_id(), 2)
+        # -1 = HWND_TOPMOST，0x0010 = SWP_NOACTIVATE：框选覆盖层不抢焦点
         if not self.api.SetWindowPos(hwnd, ctypes.c_void_p(-1), x, y, width, height, 0x0010):
             raise ctypes.WinError(ctypes.get_last_error())
 
@@ -258,12 +312,14 @@ class Hotkeys:
         registered = []
         try:
             for identifier, (key, _) in self.KEYS.items():
+                # 0x4000 = MOD_NOREPEAT：长按不重复触发
                 if not self.api.RegisterHotKey(None, identifier, 0x4000, key):
                     raise RuntimeError("F2、F8 或 F9 已被其他程序占用，请关闭冲突程序后重试。")
                 registered.append(identifier)
             self._ready.set()
             message = wintypes.MSG()
             while not self._stop.is_set():
+                # 只取 WM_HOTKEY(0x0312)，PM_REMOVE(1)：取出即出队
                 while not self._stop.is_set() and self.api.PeekMessageW(
                         ctypes.byref(message), None, 0x0312, 0x0312, 1):
                     item = self.KEYS.get(message.wParam)

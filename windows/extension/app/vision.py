@@ -43,13 +43,12 @@ class Detection:
     handle: Rect
     track_right: int
     shape_score: float
-    gap_center: tuple = None  # 缺口真实中心（轮廓矩心）
+    gap_center: tuple  # 缺口真实中心（轮廓矩心）
 
     @property
     def distance(self):
-        # 使用缺口真实中心到滑块中心的距离
-        gc = self.gap_center if self.gap_center else self.gap.center
-        return gc[0] - self.handle.center[0]
+        # 水平位移 = 缺口真实中心 - 滑块中心
+        return self.gap_center[0] - self.handle.center[0]
 
     def points(self, offset=(0, 0), correction=0):
         # 使用滑块中心作为起点
@@ -91,9 +90,14 @@ def _runs(values):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
+def _white_mask(rgb):
+    """白色像素判据：三通道都够亮且几乎无色差。"""
+    return (rgb.min(axis=2) >= 250) & (rgb.max(axis=2) - rgb.min(axis=2) <= 5)
+
+
 def _find_image(rgb, arrow):
     """从箭头位置向上扫描找到图片区域。"""
-    height, width = rgb.shape[:2]
+    width = rgb.shape[1]
     ax, ay, aw, ah = arrow.x, arrow.y, arrow.w, arrow.h
     colored = rgb.min(axis=2) < 235
 
@@ -104,22 +108,18 @@ def _find_image(rgb, arrow):
     row_mask = band.mean(axis=1) > 0.3
     row_mask = cv2.morphologyEx(row_mask.astype(np.uint8)[:, None],
                                 cv2.MORPH_CLOSE, np.ones((5, 1), np.uint8)).ravel() > 0
-    runs = _runs(row_mask)
-    above = [(t, b) for t, b in runs if b <= ay + 2 and b - t > 20]
+    above = [(t, b) for t, b in _runs(row_mask) if b <= ay + 2 and b - t > 20]
     if not above:
         return None
     top, bottom = max(above, key=lambda r: r[1] - r[0])
 
     # 水平扫描：用图片中间行找左右边界（缺口可能断开，取最左最右）
     mid_y = (top + bottom) // 2
-    row = colored[mid_y]
-    col_runs = _runs(row)
+    col_runs = _runs(colored[mid_y])
     if not col_runs:
         return None
-    left = col_runs[0][0]
-    right = col_runs[-1][1]
-    image = Rect(int(left), int(top), int(right - left), int(bottom - top))
-    return int(right), image
+    left, right = int(col_runs[0][0]), int(col_runs[-1][1])
+    return right, Rect(left, int(top), right - left, int(bottom - top))
 
 
 def detect(image):
@@ -129,17 +129,14 @@ def detect(image):
 
     # 深色箭头 = 滑块位置
     dark_mask = (rgb.max(axis=2) < 150).astype(np.uint8)
-    dark_count, dark_labels, dark_stats, _ = cv2.connectedComponentsWithStats(dark_mask, 8)
+    dark_count, _, dark_stats, _ = cv2.connectedComponentsWithStats(dark_mask, 8)
 
-    white = ((rgb.min(axis=2) >= 250) &
-             (rgb.max(axis=2).astype(int) - rgb.min(axis=2) <= 5)).astype(np.uint8)
+    white = _white_mask(rgb).astype(np.uint8)
 
     candidates = []
     for label in range(1, dark_count):
         ax, ay, aw, ah, area = map(int, dark_stats[label])
-        if not (30 <= area <= 3000):
-            continue
-        if not (4 <= aw <= 80 and 4 <= ah <= 80):
+        if not (30 <= area <= 3000 and 4 <= aw <= 80 and 4 <= ah <= 80):
             continue
         arrow = Rect(ax, ay, aw, ah)
         hs = int(round((aw * ah * 10) ** 0.5))
@@ -158,17 +155,13 @@ def detect(image):
             if not (.70 <= w / hs <= 2.00 and .70 <= h / hs <= 2.00):
                 continue
             mask = (labels[y:y+h, x:x+w] == label).astype(np.uint8) * 255
-            # 计算缺口真实中心（轮廓矩心）
-            moments = cv2.moments(mask)
-            if moments['m00'] > 0:
-                cx = int(moments['m10'] / moments['m00'])
-                cy = int(moments['m01'] / moments['m00'])
-                gap_center = (photo.x + x + cx, photo.y + y + cy)
-            else:
-                gap_center = None
             score = shape_score(mask)
             if score < .86:
                 continue
+            # 缺口真实中心 = 轮廓矩心（面积过滤已保证 m00 > 0）
+            moments = cv2.moments(mask)
+            gap_center = (photo.x + x + int(moments['m10'] / moments['m00']),
+                          photo.y + y + int(moments['m01'] / moments['m00']))
             gap = Rect(photo.x+x, photo.y+y, w, h)
             solution = Detection(photo, gap, arrow, right, score, gap_center)
             # 中心距离验证：缺口中心应在滑轨范围内
@@ -182,41 +175,25 @@ def detect(image):
     if not solutions:
         raise DetectionError("未找到可靠的白色拼图缺口和滑轨；请完整框选验证框，或保存诊断图。")
     # 按缺口位置分组，多个缺口 = 歧义，拒绝
-    gaps = {}
+    groups = {}
     for s in solutions:
-        key = (s.gap.x, s.gap.y, s.gap.w, s.gap.h)
-        gaps.setdefault(key, []).append(s)
-    if len(gaps) != 1:
+        groups.setdefault((s.gap.x, s.gap.y, s.gap.w, s.gap.h), []).append(s)
+    if len(groups) != 1:
         raise DetectionError("检测到多个可能目标；请缩小选区，只保留一个验证框。")
     # 同一缺口多个箭头，选最左边的（箭头始终在左下角）
-    candidates = next(iter(gaps.values()))
-    candidates.sort(key=lambda s: s.handle.x)
-    return candidates[0]
-
-
-def same_scene(before, after, result):
-    """只比较验证图片，避免页面背景轮播导致误报；图片变化必须重新识别。"""
-    a, b = np.asarray(before.convert("RGB")), np.asarray(after.convert("RGB"))
-    if a.shape != b.shape:
-        return False
-    a, b = result.image.crop(a), result.image.crop(b)
-    difference = np.abs(a.astype(np.int16) - b.astype(np.int16))
-    return bool(difference.mean() < 1.5 and (difference.max(axis=2) > 15).mean() < .008)
+    group = next(iter(groups.values()))
+    return min(group, key=lambda s: s.handle.x)
 
 
 def white_ratio(image, rect):
     """计算矩形区域内白色像素占比，用于拖动反馈判断缺口是否已被覆盖。"""
     rgb = np.asarray(image.convert("RGB"))
     height, width = rgb.shape[:2]
-    x1 = max(0, rect[0])
-    y1 = max(0, rect[1])
-    x2 = min(width, rect[2])
-    y2 = min(height, rect[3])
+    x1, y1 = max(0, rect[0]), max(0, rect[1])
+    x2, y2 = min(width, rect[2]), min(height, rect[3])
     if x2 <= x1 or y2 <= y1:
         return 0.
-    patch = rgb[y1:y2, x1:x2]
-    white = (patch.min(axis=2) >= 250) & (patch.max(axis=2) - patch.min(axis=2) <= 5)
-    return float(white.mean())
+    return float(_white_mask(rgb[y1:y2, x1:x2]).mean())
 
 
 def main():

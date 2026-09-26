@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 *.spec
+*.obj
 
 # 运行时生成 / 用户数据（任意平台子目录均忽略）
 region.json
@@ -27,3 +28,6 @@ com.fxxk_puzzle.host.json
 
 /RELEASE.md
 tests/
+
+# 本地发布说明（贴到 GitHub Releases 用，不进源码集）
+RELEASE_NOTE.md

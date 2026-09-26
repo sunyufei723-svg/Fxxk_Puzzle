@@ -10,7 +10,8 @@ HERE = Path(__file__).resolve().parent
 BUILD = HERE / "build"
 RAW = HERE / "dist" / "_extension_raw"
 RELEASE = HERE / "dist" / "Fxxk_Puzzle-extension"
-NATIVE = HERE / "native"
+INSTALLER = HERE / "installer"
+NATIVE = INSTALLER
 NATIVE_BUILD = NATIVE / "build"
 
 
@@ -63,7 +64,7 @@ def build_native_installers():
 
 
 def main():
-    positions = HERE / "browser_positions.json"
+    positions = INSTALLER / "browser_positions.json"
     position_values = validate_positions(positions)
     for path in (BUILD, RAW, RELEASE, NATIVE_BUILD):
         if path.exists():
@@ -77,7 +78,7 @@ def main():
 
     RELEASE.mkdir(parents=True)
     shutil.copytree(RAW / "Fxxk_Puzzle", RELEASE / "app")
-    shutil.copytree(HERE / "extension", RELEASE / "extensions")
+    shutil.copytree(HERE / "browser_extension", RELEASE / "extensions")
     shutil.copy2(NATIVE_BUILD / "Setup.exe", RELEASE / "Setup.exe")
     shutil.copy2(NATIVE_BUILD / "Uninstall.exe", RELEASE / "Uninstall.exe")
     shutil.copy2(HERE / "README.md", RELEASE / "README.md")

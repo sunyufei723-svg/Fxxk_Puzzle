@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <uiautomation.h>
 #include <wrl/client.h>
@@ -21,7 +22,6 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -35,13 +35,18 @@ namespace native {
 namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
 
+inline std::string Utf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+}
+
 inline std::runtime_error Error(const std::wstring& message) {
-    const int size = WideCharToMultiByte(CP_UTF8, 0, message.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string utf8(static_cast<size_t>(size > 0 ? size : 0), '\0');
-    if (size > 0) WideCharToMultiByte(CP_UTF8, 0, message.c_str(), -1, utf8.data(), size,
-                                      nullptr, nullptr);
-    if (!utf8.empty() && utf8.back() == '\0') utf8.pop_back();
-    return std::runtime_error(utf8);
+    return std::runtime_error(Utf8(message));
 }
 
 inline void Check(bool condition, const std::wstring& message) {
@@ -65,14 +70,16 @@ inline fs::path LocalAppData() {
     return path;
 }
 
-inline std::string Utf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-                                         nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-                        result.data(), size, nullptr, nullptr);
-    return result;
+inline bool HasArgument(const wchar_t* expected) {
+    int count = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!arguments) return false;
+    bool found = false;
+    for (int index = 1; index < count; ++index) {
+        if (_wcsicmp(arguments[index], expected) == 0) found = true;
+    }
+    LocalFree(arguments);
+    return found;
 }
 
 inline std::wstring WideFromUtf8(const char* value) {
@@ -207,7 +214,7 @@ inline void RegisterUninstall(const fs::path& installDir, const fs::path& execut
           L"无法登记 Windows 卸载信息");
     const auto uninstaller = installDir / L"Uninstall.exe";
     SetRegistryString(key, L"DisplayName", L"拼图助手（Extension 版）");
-    SetRegistryString(key, L"DisplayVersion", L"1.0.0");
+    SetRegistryString(key, L"DisplayVersion", L"2.1.0");
     SetRegistryString(key, L"Publisher", L"Fxxk Puzzle");
     SetRegistryString(key, L"InstallLocation", installDir.wstring());
     SetRegistryString(key, L"DisplayIcon", executable.wstring());
@@ -272,8 +279,9 @@ inline std::wstring ProcessNameForWindow(HWND window) {
 }
 
 inline std::vector<HWND> BrowserWindows(const std::wstring& executableName) {
+    std::vector<HWND> windows;
     struct Context { const std::wstring* name; std::vector<HWND>* windows; } context{
-        &executableName, new std::vector<HWND>()};
+        &executableName, &windows};
     EnumWindows([](HWND window, LPARAM raw) -> BOOL {
         auto* context = reinterpret_cast<Context*>(raw);
         wchar_t className[128]{};
@@ -284,9 +292,7 @@ inline std::vector<HWND> BrowserWindows(const std::wstring& executableName) {
         }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&context));
-    auto result = std::move(*context.windows);
-    delete context.windows;
-    return result;
+    return windows;
 }
 
 inline void SendVirtualKey(WORD key, bool down) {
@@ -308,12 +314,10 @@ inline bool ForceForegroundWindow(HWND window) {
     if (!window) return false;
     ShowWindow(window, SW_MAXIMIZE);
     const DWORD currentThread = GetCurrentThreadId();
-    DWORD targetProcess = 0;
-    const DWORD targetThread = GetWindowThreadProcessId(window, &targetProcess);
+    const DWORD targetThread = GetWindowThreadProcessId(window, nullptr);
     const HWND oldForeground = GetForegroundWindow();
-    DWORD oldProcess = 0;
     const DWORD oldThread = oldForeground
-        ? GetWindowThreadProcessId(oldForeground, &oldProcess) : 0;
+        ? GetWindowThreadProcessId(oldForeground, nullptr) : 0;
     if (targetThread && targetThread != currentThread) AttachThreadInput(currentThread, targetThread, TRUE);
     if (oldThread && oldThread != currentThread && oldThread != targetThread) {
         AttachThreadInput(currentThread, oldThread, TRUE);
@@ -490,36 +494,84 @@ inline bool UseUiaOrCoordinates(IUIAutomation* automation, IUIAutomationElement*
     return ClickCalibrated(window, xRatio, yRatio);
 }
 
-inline HWND WaitFolderDialog(DWORD timeoutMs) {
+inline bool FolderDialogAlive(HWND dialog) {
+    // 只用 IsWindow 判活会被句柄复用骗过：对话框关掉后，Chrome 再弹出的新对话框
+    // 很可能拿到同一个 HWND 数值，于是被误判成"上一个还没关"。
+    if (!dialog || !IsWindow(dialog) || !IsWindowVisible(dialog)) return false;
+    wchar_t className[16]{};
+    GetClassNameW(dialog, className, 16);
+    return wcscmp(className, L"#32770") == 0;
+}
+
+// 点击「加载已解压的扩展程序」之前先记下系统里已存在的对话框，之后只认新出现的那一个。
+// WeGame 这类常驻程序会保有一个类名同为 #32770 的隐藏窗口，它一旦被切到前台就会被误认成
+// 扩展目录框：路径粘进了别人家的窗口、真框被空回车关掉、扩展没加载，而代码还在等那扇
+// 永远关不上的门。
+inline std::set<HWND> VisibleFolderDialogs() {
+    std::set<HWND> found;
+    EnumWindows([](HWND window, LPARAM raw) -> BOOL {
+        wchar_t name[16]{};
+        GetClassNameW(window, name, 16);
+        if (IsWindowVisible(window) && wcscmp(name, L"#32770") == 0)
+            reinterpret_cast<std::set<HWND>*>(raw)->insert(window);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+inline HWND WaitFolderDialog(DWORD timeoutMs, const std::set<HWND>& preexisting) {
     const auto deadline = GetTickCount64() + timeoutMs;
     while (GetTickCount64() < deadline) {
-        HWND foreground = GetForegroundWindow();
-        wchar_t className[64]{};
-        if (foreground) GetClassNameW(foreground, className, 64);
-        if (foreground && wcscmp(className, L"#32770") == 0) return foreground;
-        struct Context { HWND result = nullptr; } context;
-        EnumWindows([](HWND window, LPARAM raw) -> BOOL {
-            auto* context = reinterpret_cast<Context*>(raw);
-            wchar_t name[64]{};
-            GetClassNameW(window, name, 64);
-            if (IsWindowVisible(window) && wcscmp(name, L"#32770") == 0) {
-                context->result = window;
-                return FALSE;
-            }
-            return TRUE;
-        }, reinterpret_cast<LPARAM>(&context));
-        if (context.result) return context.result;
+        for (const auto& window : VisibleFolderDialogs()) {
+            // 不按进程归属过滤：Chrome 已在运行时，扩展页窗口与文件夹对话框并不总是
+            // 同一个 PID，按 PID 匹配会把真框滤掉。
+            if (preexisting.contains(window)) continue;
+            return window;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return nullptr;
 }
 
+// 把路径直接写进文件名框，确认写进去了再点接受按钮。
+// 实测 Ctrl+L 在 Windows 文件对话框里并不会聚焦文件名框（那是浏览器地址栏的习惯），
+// 于是一路 Ctrl+V 之后 Edit 仍然是空的；此时若点「选择文件夹」，选中的是当前浏览到的
+// 目录而不是扩展目录，Chrome 会因为找不到 manifest 而加载失败。
+inline bool AcceptFolderDialog(HWND dialog, const std::wstring& path) {
+    auto edit = FindWindowExW(dialog, nullptr, L"Edit", nullptr);
+    if (!edit) return false;
+    SetWindowTextW(edit, path.c_str());
+    wchar_t written[2048]{};
+    if (GetWindowTextW(edit, written, 2048) <= 0 || path != written) return false;
+    for (const wchar_t* label : {L"选择文件夹", L"Select", L"Select Folder", L"打开", L"确定", L"OK"}) {
+        if (auto accept = FindWindowExW(dialog, nullptr, L"Button", label)) {
+            SendMessageW(accept, BM_CLICK, 0, 0);
+            return true;
+        }
+    }
+    SendVirtualKey(VK_RETURN, true);
+    SendVirtualKey(VK_RETURN, false);
+    return true;
+}
+
 inline void ChooseExtensionFolder(IUIAutomation* automation, HWND dialog,
                                   const fs::path& extensionDir) {
     Check(dialog != nullptr, L"没有出现选择扩展文件夹的窗口");
+    std::wstring path = extensionDir.wstring();
+    // 安装目录是 "Programs/FxxkPuzzleExtension" 拼出来的，带正斜杠；文件对话框按
+    // 反斜杠的规范路径处理更稳妥。
+    std::replace(path.begin(), path.end(), L'/', L'\\');
     SetForegroundWindow(dialog);
+
+    if (AcceptFolderDialog(dialog, path)) {
+        for (int wait = 0; wait < 20 && FolderDialogAlive(dialog); ++wait)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!FolderDialogAlive(dialog)) return;
+
+    // 兜底 1：剪贴板 + Ctrl+L/Ctrl+V/Enter
     {
-        ClipboardGuard clipboard(extensionDir.wstring());
+        ClipboardGuard clipboard(path);
         SendChord(VK_CONTROL, 'L');
         SendChord(VK_CONTROL, 'V');
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -527,17 +579,20 @@ inline void ChooseExtensionFolder(IUIAutomation* automation, HWND dialog,
         SendVirtualKey(VK_RETURN, false);
         std::this_thread::sleep_for(std::chrono::milliseconds(800));
     }
+    // 粘贴 + 回车若已让对话框接受并关闭，必须立刻收手：再补一次回车会落到扩展页面上，
+    // 把"加载已解压的扩展程序"重新触发一遍。
+    if (!FolderDialogAlive(dialog)) return;
+
+    // 兜底 2：UIA 找接受按钮（覆盖按钮文字不在名单里的界面语言）
     ComPtr<IUIAutomationElement> root;
     automation->ElementFromHandle(dialog, &root);
     auto button = root ? FindNamedElement(automation, root.Get(),
-        {L"选择文件夹", L"选择文件夹(&S)", L"Select Folder", L"Select Folder (&S)"}, 1500)
+        {L"选择文件夹", L"选择文件夹(&S)", L"Select", L"Select Folder", L"Select Folder (&S)",
+         L"打开", L"确定", L"OK"}, 1500)
         : nullptr;
-    if (!button || !ActivateUiaElement(button.Get(), false)) {
-        SendVirtualKey(VK_RETURN, true);
-        SendVirtualKey(VK_RETURN, false);
-    }
+    if (button) ActivateUiaElement(button.Get(), false);
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    Check(!IsWindow(dialog), L"文件夹选择窗口仍未关闭，扩展可能尚未加载");
+    Check(!FolderDialogAlive(dialog), L"文件夹选择窗口仍未关闭，扩展可能尚未加载");
 }
 
 inline void InstallBrowserExtension(
@@ -565,10 +620,12 @@ inline void InstallBrowserExtension(
               L"UI Automation 和备用坐标均无法操作“开发人员模式”");
         std::this_thread::sleep_for(std::chrono::milliseconds(900));
     }
+    const auto preexistingDialogs = VisibleFolderDialogs();
     Check(UseUiaOrCoordinates(automation.Get(), root.Get(), window, loadNames, false,
                               points.load_x, points.load_y, progress),
           L"UI Automation 和备用坐标均无法操作“加载未打包的扩展”");
-    ChooseExtensionFolder(automation.Get(), WaitFolderDialog(10000), extensionDir);
+    ChooseExtensionFolder(automation.Get(),
+                          WaitFolderDialog(10000, preexistingDialogs), extensionDir);
 }
 
 inline void OpenTargetUrl(const fs::path& executable, const std::wstring& url) {
