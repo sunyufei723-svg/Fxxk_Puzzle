@@ -1,0 +1,12 @@
+{
+  "target_url": "https://login.sufe.edu.cn/",
+  "target_host": "login.sufe.edu.cn",
+  "target_path_prefix": "/",
+  "browsers": ["chrome.exe", "msedge.exe"],
+  "hotkeys": {
+    "select": "F8",
+    "execute": "F9",
+    "cancel": "F2"
+  },
+  "check_interval_seconds": 1.0
+}
