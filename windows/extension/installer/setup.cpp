@@ -313,7 +313,7 @@ private:
     }
 
     void ShowSummary() {
-        const auto destination = native::LocalAppData() / L"Programs/FxxkPuzzleExtension";
+        const auto destination = native::LocalAppData() / L"Programs" / L"FxxkPuzzleExtension";
         std::wstring browsers;
         if (chromeSelected_) browsers = L"Chrome";
         if (edgeSelected_) browsers += browsers.empty() ? L"Edge" : L"、Edge";
@@ -446,13 +446,15 @@ private:
             const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             try {
                 const fs::path source(native::ModuleDirectory());
-                const fs::path destination = native::LocalAppData() / L"Programs/FxxkPuzzleExtension";
+                const fs::path destination = native::LocalAppData() / L"Programs" / L"FxxkPuzzleExtension";
                 PostProgress(L"正在复制应用文件……");
                 native::CopyPayload(source, destination, url, select, execute, cancel);
                 PostProgress(L"正在注册 fxxk-puzzle:// 启动协议……");
                 native::RegisterProtocol(destination / L"app/Fxxk_Puzzle.exe");
                 PostProgress(L"正在注册 Windows 卸载程序……");
-                native::RegisterUninstall(destination, destination / L"app/Fxxk_Puzzle.exe");
+                // --extension 让同一个卸载器知道要顺带调用 Extension_Cleanup.exe 清浏览器条目。
+                native::RegisterUninstall(destination, destination / L"app/Fxxk_Puzzle.exe",
+                                        L"--extension");
                 auto progress = [this](const std::wstring& text) { PostProgress(text); };
                 if (chrome) {
                     native::InstallBrowserExtension(L"chrome", native::FindBrowser(L"chrome"),

@@ -1,6 +1,7 @@
 """Read Chromium's current page URL without changing focus or clipboard."""
 
 import ctypes
+import re
 import time
 from ctypes import wintypes
 from urllib.parse import parse_qs, urlsplit
@@ -105,12 +106,23 @@ class AddressBar:
             return None
 
 
+def bare_url(value):
+    """去掉协议头和根路径的结尾斜杠。
+
+    Chrome/Edge 的地址栏显示的是 `example.com` 而不是 `https://example.com/`，
+    安装时写进扩展的 targetUrl 却带协议头。两边都归一化之前，target 形如
+    `https://xxx/` 会永远匹配不上地址栏，离开页面也就不会自动退出。
+    """
+    value = str(value or "").strip().casefold()
+    return re.sub(r"^[a-z0-9+.-]+://", "", value).rstrip("/")
+
+
 def matches_target(url, target_url):
     """Keep the Extension version's intentionally broad substring semantics."""
     if not isinstance(url, str):
         return False
-    target_url = target_url.strip()
-    return bool(target_url) and target_url.casefold() in url.casefold()
+    target = bare_url(target_url)
+    return bool(target) and target in bare_url(url)
 
 
 def target_from_launch_uri(value):
@@ -121,6 +133,36 @@ def target_from_launch_uri(value):
         return ""
     values = parse_qs(parsed.query).get("target", [])
     return values[0].strip() if values else ""
+
+
+def _query_flag(value, name):
+    parsed = urlsplit(value) if isinstance(value, str) else None
+    if not parsed or parsed.scheme.casefold() != "fxxk-puzzle":
+        return None
+    if parsed.netloc.casefold() not in ("launch", "settings"):
+        return None
+    values = parse_qs(parsed.query).get(name, [])
+    if not values:
+        return None
+    flag = values[0].strip().casefold()
+    if flag in ("1", "true", "on", "show"):
+        return True
+    if flag in ("0", "false", "off", "hide"):
+        return False
+    return None
+
+
+def show_window_from_launch_uri(value):
+    """读 URI 里的 &show=0/1 —— 扩展 popup 的「静默启动」就靠它落到 settings.json。
+
+    没带这个参数返回 None：手动双击程序、或旧版扩展拉起时都不该改用户的设置。
+    """
+    return _query_flag(value, "show")
+
+
+def is_settings_uri(value):
+    """fxxk-puzzle://settings?... 只改设置，不弹操作界面。"""
+    return isinstance(value, str) and urlsplit(value).netloc.casefold() == "settings"
 
 
 class TargetPageGuard:

@@ -22,6 +22,8 @@ async function configuredTargetUrl() {
 
 function launchProgram(targetUrl) {
   const target = encodeURIComponent(targetUrl);
+  // 这里刻意不带 show 参数：静默与否只认程序自己 settings.json 里的值，
+  // 每次拉起都推一份会把用户在程序设置页里的改动盖掉。
   chrome.tabs.create({ url: `fxxk-puzzle://launch?target=${target}` });
 }
 

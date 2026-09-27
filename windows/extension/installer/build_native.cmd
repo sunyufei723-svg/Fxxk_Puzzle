@@ -23,5 +23,7 @@ cl.exe /nologo /std:c++20 /O2 /MT /EHsc /utf-8 /W4 /DUNICODE /D_UNICODE ^
 cl.exe /nologo /std:c++20 /O2 /MT /EHsc /utf-8 /W4 /DUNICODE /D_UNICODE ^
   /Fo:"build\\" /Fe:"build\Uninstall.exe" uninstall.cpp "build\resource.res" /link /SUBSYSTEM:WINDOWS || exit /b 1
 cl.exe /nologo /std:c++20 /O2 /MT /EHsc /utf-8 /W4 /DUNICODE /D_UNICODE ^
+  /Fo:"build\\" /Fe:"build\Extension_Cleanup.exe" extension_cleanup.cpp /link /SUBSYSTEM:CONSOLE || exit /b 1
+cl.exe /nologo /std:c++20 /O2 /MT /EHsc /utf-8 /W4 /DUNICODE /D_UNICODE ^
   /Fo:"build\\" /Fe:"build\UiaProbe.exe" uia_probe.cpp /link /SUBSYSTEM:CONSOLE || exit /b 1
 endlocal

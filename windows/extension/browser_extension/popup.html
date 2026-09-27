@@ -9,6 +9,13 @@
     width: 100%; padding: 8px; box-sizing: border-box;
     border: 1px solid #cbd5e1; border-radius: 4px; font-size: 13px;
   }
+  label.row {
+    display: flex; align-items: flex-start; gap: 6px;
+    font-size: 13px; color: #334155; line-height: 1.5;
+  }
+  input[type="checkbox"] {
+    width: auto; padding: 0; margin: 3px 0 0; flex: none;
+  }
   button {
     width: 100%; padding: 8px; margin-top: 8px;
     background: #2563eb; color: #fff; border: none; border-radius: 4px;
@@ -23,6 +30,10 @@
   <label>验证码页面网址关键词（匹配即触发）</label>
   <input id="url" placeholder="如 example.com/captcha" />
   <button id="save">保存</button>
+  <label class="row">
+    <input id="silent" type="checkbox" />
+    静默启动：不弹操作窗口，用 F8 框选、F9 识别并拖动（与程序「设置」页是同一个开关）
+  </label>
   <div id="status"></div>
   <script src="popup.js"></script>
 </body>

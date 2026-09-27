@@ -81,6 +81,7 @@ def main():
     shutil.copytree(HERE / "browser_extension", RELEASE / "extensions")
     shutil.copy2(NATIVE_BUILD / "Setup.exe", RELEASE / "Setup.exe")
     shutil.copy2(NATIVE_BUILD / "Uninstall.exe", RELEASE / "Uninstall.exe")
+    shutil.copy2(NATIVE_BUILD / "Extension_Cleanup.exe", RELEASE / "Extension_Cleanup.exe")
     shutil.copy2(HERE / "README.md", RELEASE / "README.md")
     shutil.make_archive(str(HERE / "dist" / "Fxxk_Puzzle-extension-portable"), "zip",
                         root_dir=RELEASE.parent, base_dir=RELEASE.name)

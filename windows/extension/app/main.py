@@ -14,7 +14,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import ImageTk, ImageGrab
 
-from app.browser import TargetPageGuard, foreground_browser_info, target_from_launch_uri
+from app.browser import (TargetPageGuard, foreground_browser_info, is_settings_uri,
+                         show_window_from_launch_uri, target_from_launch_uri)
 from app.controls import (WindowsDesktop, enable_dpi_awareness, Hotkeys,
                           DragCancelled, vk_for_function_key)
 from app.vision import detect, DetectionError, white_ratio
@@ -101,13 +102,17 @@ class RegionSelector:
 
 class PuzzleAssistant:
     def __init__(self, root, desktop, register_hotkeys=True, region_path=None,
-                 page_guard=None):
+                 page_guard=None, monitor_mode=False, settings_path=None):
         self.root, self.desktop = root, desktop
         self.region_path = Path(region_path) if region_path else _project_dir() / "region.json"
-        self.settings_path = _project_dir() / "settings.json"
+        self.settings_path = Path(settings_path) if settings_path else _project_dir() / "settings.json"
         self.register_hotkeys = register_hotkeys
         self.page_guard = page_guard
-        self.drag_speed, self.hotkey_names = self._load_settings()
+        # monitor_mode 只决定没存过设置时的默认值：Monitor 版后台常驻，默认静默；
+        # Extension 版可能被直接双击打开，默认得看得见窗口。「是否弹窗」这一项
+        # 两版都能在程序设置页和浏览器扩展里改，落的是同一个 settings.json 键。
+        self.monitor_mode = monitor_mode
+        self.drag_speed, self.hotkey_names, self.show_window_on_target = self._load_settings()
         self._apply_hotkey_config()
         self.hotkeys = self._make_hotkeys() if register_hotkeys else None
         self._pending, self._poll_id, self.gen = set(), None, 0
@@ -129,15 +134,16 @@ class PuzzleAssistant:
     # ---- 配置读写：region.json 与 settings.json 都走同一套原子写 ----
     def _write_json(self, path, data, error):
         try:
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp.replace(path)
+            _write_json_atomic(path, data)
         except OSError as exc:
             self.log(f"{error}：{exc}", "error")
 
     # ---- 设置：拖动速度 + 可改快捷键（持久化到 settings.json） ----
     def _load_settings(self):
         speed, hotkeys = DEFAULT_SPEED, dict(DEFAULT_HOTKEYS)
+        # 默认值按版本分：Monitor 版是后台常驻，默认静默；extension 版可能被用户
+        # 直接双击程序打开，默认不弹的话就完全没有反馈了。
+        show_window = not self.monitor_mode
         try:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -150,12 +156,16 @@ class PuzzleAssistant:
                         v = hk.get(action)
                         if isinstance(v, str) and v in FUNCTION_KEYS:
                             hotkeys[action] = v
+                flag = data.get("show_window_on_target")
+                if isinstance(flag, bool):
+                    show_window = flag
         except (OSError, ValueError):
             pass
-        return speed, hotkeys
+        return speed, hotkeys, show_window
 
     def _save_settings(self):
-        data = {"drag_speed": self.drag_speed, "hotkeys": dict(self.hotkey_names)}
+        data = {"drag_speed": self.drag_speed, "hotkeys": dict(self.hotkey_names),
+                "show_window_on_target": bool(self.show_window_on_target)}
         self._write_json(self.settings_path, data, "设置保存失败")
 
     def _apply_hotkey_config(self):
@@ -361,8 +371,22 @@ class PuzzleAssistant:
             cb.grid(row=i + 1, column=1, sticky="w", pady=4)
             cb.bind("<<ComboboxSelected>>", lambda e, a=action, c=cb: self._on_hotkey(a, c))
             self.hotkey_vars[action] = var
+        hint_row = len(rows) + 1
+        # BooleanVar 同样必须挂在 self 上，否则被 GC 后勾选框会失焦复位。
+        self.show_window_var = tk.BooleanVar(value=self.show_window_on_target)
+        ttk.Checkbutton(
+            panel, text="进入验证码页面时自动弹出操作窗口（取消勾选＝静默，用 F8/F9 操作）",
+            variable=self.show_window_var, command=self._on_show_window).grid(
+            row=hint_row, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        hint_row += 1
         ttk.Label(panel, text="快捷键仅支持 F1~F12；改后立即生效并自动保存。",
-                  foreground="#506078").grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+                  foreground="#506078").grid(row=hint_row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def _on_show_window(self):
+        self.show_window_on_target = bool(self.show_window_var.get())
+        self._save_settings()
+        self.log("已开启自动弹出操作窗口" if self.show_window_on_target
+                 else "已改为静默启动：进入页面时不再弹窗，用 F8/F9 操作", "info")
 
     def later(self, delay, cb):
         gen = self.gen
@@ -544,10 +568,15 @@ class PuzzleAssistant:
         self.details.set("异常，请切换到「日志」页保存诊断截图")
         if not self.region:
             self._set_hint(self._hint1())
-        self.show()
+        self.show(force=True)
 
-    def show(self):
+    def show(self, force=False):
         if self.closing:
+            return
+        if not force and not self.show_window_on_target:
+            # 静默启动：识别完成、框选、取消都不弹预览，只刷新按钮状态；
+            # 出问题时 fail() 会带 force 把窗口叫出来，别让用户摸不着头脑。
+            self.set_buttons()
             return
         self.root.deiconify()
         self.root.lift()
@@ -587,7 +616,6 @@ class PuzzleAssistant:
                 for a in actions:
                     if a == "select":
                         self._on_select()
-                        self._auto_drag = True
                     elif a == "execute":
                         self._auto_drag = True
                         self.request_capture(False)
@@ -633,6 +661,30 @@ def _project_dir():
     return Path(sys.executable if getattr(sys, 'frozen', False) else __file__).parent
 
 
+def _write_json_atomic(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def persist_show_window(value, path=None):
+    """把扩展 popup 推过来的静默开关写进 settings.json。
+
+    只改这一个键，其余原样保留。即使已经有一个实例在跑也照写：那个实例下次
+    启动就会读到。这样「程序里改」和「扩展里改」落的是同一份设置，谁都不会在
+    下次拉起时被对方悄悄覆盖回去。
+    """
+    path = path or _project_dir() / "settings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data["show_window_on_target"] = bool(value)
+    _write_json_atomic(path, data)
+
+
 def _acquire_single_instance():
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
@@ -653,18 +705,27 @@ def main():
                         help="仅启动界面后退出，不截屏、不操作鼠标")
     parser.add_argument("launch_uri", nargs="?")
     args, _ = parser.parse_known_args()
+    enable_dpi_awareness()
+    # 扩展 popup 的开关走这条路进来：先落盘，再决定要不要起界面。已经有实例在跑
+    # 也得写，否则「扩展里改了没生效」。
+    show_window = show_window_from_launch_uri(args.launch_uri)
+    if show_window is not None:
+        persist_show_window(show_window)
     instance = _acquire_single_instance()
     if instance is None:
         return 0
     try:
+        if is_settings_uri(args.launch_uri):
+            return 0            # 只是来改设置的，不弹操作界面
         target_url = target_from_launch_uri(args.launch_uri)
         page_guard = None
         if target_url:
             # 记录启动它的浏览器窗口，用于离开目标页后自动退出
             browser_info = foreground_browser_info()
             page_guard = TargetPageGuard(target_url, browser_info[0] if browser_info else None)
-        enable_dpi_awareness()
         root = tk.Tk()
+        # 先藏起来再建界面：静默模式下不闪一下，非静默也只是晚一帧出现。
+        root.withdraw()
         try:
             app = PuzzleAssistant(
                 root,
@@ -676,12 +737,15 @@ def main():
             messagebox.showerror("启动失败", str(exc), parent=root)
             root.destroy()
             return 1
-        if not args.smoke_test and app.region:
-            # 有选区文件就不必再点一次「识别」：启动即自动截图定位一次。
-            # 「识别」按钮保留，用于换题或这次没定位到时重来。
-            app.recognize()
         if args.smoke_test:
             root.after(400, app.close)
+        elif app.show_window_on_target:
+            app.show()
+            if app.region:
+                # 有选区文件就不必再点一次「识别」：启动即自动截图定位一次。
+                # 「识别」按钮保留，用于换题或这次没定位到时重来。
+                app.recognize()
+        # 静默启动时窗口保持隐藏：F8/F9/F2 全局热键和页面守卫照常工作。
         root.mainloop()
         return 0
     finally:

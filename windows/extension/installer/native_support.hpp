@@ -10,11 +10,13 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <oleacc.h>
 #include <tlhelp32.h>
 #include <uiautomation.h>
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -29,11 +31,22 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "oleacc.lib")
 
 namespace native {
 
 namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
+
+// Extension_Cleanup.exe 的退出码，卸载器按位解读，两边必须一致。
+enum CleanupStatus : int {
+    kCleanupClean = 0,
+    kCleanupChrome = 1,   // Chrome 里还留着条目
+    kCleanupEdge = 2,     // Edge 里还留着条目
+    kCleanupNotFound = 4, // 两个浏览器都没有指向该目录的条目
+    kCleanupBroken = 8,   // 参数或环境不对，什么都没做成
+};
 
 inline std::string Utf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -206,21 +219,23 @@ inline uint64_t DirectorySize(const fs::path& root) {
     return total;
 }
 
-inline void RegisterUninstall(const fs::path& installDir, const fs::path& executable) {
+inline void RegisterUninstall(const fs::path& installDir, const fs::path& executable,
+                              const std::wstring& arguments = L"") {
     constexpr auto path = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FxxkPuzzleExtension";
     HKEY key = nullptr;
     Check(RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, nullptr, 0, KEY_WRITE, nullptr,
                           &key, nullptr) == ERROR_SUCCESS,
           L"无法登记 Windows 卸载信息");
     const auto uninstaller = installDir / L"Uninstall.exe";
+    const std::wstring command = L"\"" + uninstaller.wstring() + L"\"" +
+        (arguments.empty() ? L"" : L" " + arguments);
     SetRegistryString(key, L"DisplayName", L"拼图助手（Extension 版）");
-    SetRegistryString(key, L"DisplayVersion", L"2.1.1");
+    SetRegistryString(key, L"DisplayVersion", L"2.2.0");
     SetRegistryString(key, L"Publisher", L"Fxxk Puzzle");
     SetRegistryString(key, L"InstallLocation", installDir.wstring());
     SetRegistryString(key, L"DisplayIcon", executable.wstring());
-    SetRegistryString(key, L"UninstallString", L"\"" + uninstaller.wstring() + L"\"");
-    SetRegistryString(key, L"QuietUninstallString",
-                      L"\"" + uninstaller.wstring() + L"\" --quiet");
+    SetRegistryString(key, L"UninstallString", command);
+    SetRegistryString(key, L"QuietUninstallString", command + L" --quiet");
     SYSTEMTIME now{};
     GetLocalTime(&now);
     wchar_t date[16]{};
@@ -245,12 +260,17 @@ inline void CopyPayload(const fs::path& source, const fs::path& destination,
     Check(fs::is_regular_file(source / L"extensions/manifest.json"),
           L"安装包缺少 extensions\\manifest.json");
     Check(fs::is_regular_file(source / L"Uninstall.exe"), L"安装包缺少 Uninstall.exe");
+    Check(fs::is_regular_file(source / L"Extension_Cleanup.exe"),
+          L"安装包缺少 Extension_Cleanup.exe");
     fs::create_directories(destination);
     fs::copy(source / L"app", destination / L"app",
              fs::copy_options::recursive | fs::copy_options::overwrite_existing);
     fs::copy(source / L"extensions", destination / L"extensions",
              fs::copy_options::recursive | fs::copy_options::overwrite_existing);
     fs::copy_file(source / L"Uninstall.exe", destination / L"Uninstall.exe",
+                  fs::copy_options::overwrite_existing);
+    // 卸载时要移除浏览器条目，靠的是这个独立小程序，卸载器自己不带 UIA 代码。
+    fs::copy_file(source / L"Extension_Cleanup.exe", destination / L"Extension_Cleanup.exe",
                   fs::copy_options::overwrite_existing);
     WriteUtf8(destination / L"extensions/config.json",
               "{\n  \"targetUrl\": \"" + JsonEscape(url) + "\"\n}\n");
@@ -310,8 +330,7 @@ inline void SendChord(WORD modifier, WORD key) {
     SendVirtualKey(modifier, false);
 }
 
-inline bool ForceForegroundWindow(HWND window) {
-    if (!window) return false;
+inline bool ForceForegroundWindowOnce(HWND window) {
     ShowWindow(window, SW_MAXIMIZE);
     const DWORD currentThread = GetCurrentThreadId();
     const DWORD targetThread = GetWindowThreadProcessId(window, nullptr);
@@ -322,6 +341,9 @@ inline bool ForceForegroundWindow(HWND window) {
     if (oldThread && oldThread != currentThread && oldThread != targetThread) {
         AttachThreadInput(currentThread, oldThread, TRUE);
     }
+    // Windows 会拦住非前台进程的 SetForegroundWindow；按一下 Alt 是公开的解锁手法。
+    keybd_event(VK_MENU, 0x36, KEYEVENTF_EXTENDEDKEY, 0);
+    keybd_event(VK_MENU, 0x36, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
     BringWindowToTop(window);
     SetForegroundWindow(window);
     SetFocus(window);
@@ -329,7 +351,15 @@ inline bool ForceForegroundWindow(HWND window) {
         AttachThreadInput(currentThread, oldThread, FALSE);
     }
     if (targetThread && targetThread != currentThread) AttachThreadInput(currentThread, targetThread, FALSE);
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    return GetForegroundWindow() == window;
+}
+
+inline bool ForceForegroundWindow(HWND window) {
+    if (!window) return false;
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        if (ForceForegroundWindowOnce(window)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
     return GetForegroundWindow() == window;
 }
 
@@ -382,16 +412,25 @@ inline HWND OpenExtensionPage(const std::wstring& browser, const fs::path& execu
     CloseHandle(process.hProcess);
     HWND selected = nullptr;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    // 只认真正新出现的窗口，并优先挑标题还是 about:blank 的那个。旧版这里会退回
+    // "当前前台的浏览器窗口"，于是把地址栏输入发进了用户早就开着的窗口。
     while (std::chrono::steady_clock::now() < deadline && !selected) {
-        const auto windows = BrowserWindows(executableName);
-        for (HWND window : windows) if (!previous.contains(window)) { selected = window; break; }
-        if (!selected) {
-            const HWND foreground = GetForegroundWindow();
-            if (std::find(windows.begin(), windows.end(), foreground) != windows.end()) selected = foreground;
+        std::vector<HWND> fresh;
+        for (HWND window : BrowserWindows(executableName)) {
+            if (!previous.contains(window)) fresh.push_back(window);
         }
+        for (HWND window : fresh) {
+            wchar_t title[512]{};
+            GetWindowTextW(window, title, 512);
+            if (wcsstr(title, L"about:blank") != nullptr) {
+                selected = window;
+                break;
+            }
+        }
+        if (!selected && !fresh.empty()) selected = fresh.front();
         if (!selected) std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
-    Check(selected != nullptr, L"浏览器窗口没有在规定时间内出现");
+    Check(selected != nullptr, L"浏览器没有开出新窗口，无法打开扩展管理页面");
     Check(ForceForegroundWindow(selected), L"无法激活浏览器窗口");
     std::this_thread::sleep_for(std::chrono::milliseconds(800));
     SendChord(VK_CONTROL, 'L');
@@ -684,6 +723,126 @@ inline void VerifyExtensionLoaded(IUIAutomation* automation, HWND window,
                  L"选择 extensions 文件夹。");
 }
 
+// ---- 浏览器扩展页的 UIA 遍历 ----
+//
+// Chromium 的 UIA 提供程序不支持按 AutomationId 做服务端条件查询：实测同一时刻
+// FindFirst(AutomationId='itemsList') 查不到、FindFirst(Name='拼图助手') 查得到，
+// 且真条件 FindAll 只返回控件视图的 92 个节点，而原始视图实际有 340 个。
+// （原生 #32770 文件夹对话框没这个问题，所以 FindEditById 仍用条件查询。）
+// 这里一律自己按原始视图遍历。
+
+inline std::wstring ElementName(IUIAutomationElement* element) {
+    BSTR raw = nullptr;
+    if (element) element->get_CurrentName(&raw);
+    std::wstring text = raw ? raw : L"";
+    SysFreeString(raw);
+    return text;
+}
+
+inline std::wstring ElementAutomationId(IUIAutomationElement* element) {
+    BSTR raw = nullptr;
+    if (element) element->get_CurrentAutomationId(&raw);
+    std::wstring text = raw ? raw : L"";
+    SysFreeString(raw);
+    return text;
+}
+
+inline std::wstring ElementClassName(IUIAutomationElement* element) {
+    BSTR raw = nullptr;
+    if (element) element->get_CurrentClassName(&raw);
+    std::wstring text = raw ? raw : L"";
+    SysFreeString(raw);
+    return text;
+}
+
+inline int ElementControlType(IUIAutomationElement* element) {
+    int value = 0;
+    if (element) element->get_CurrentControlType(&value);
+    return value;
+}
+
+// 有界的原始视图深度优先遍历；visitor 返回 true 就立刻停。
+inline bool WalkRaw(IUIAutomationTreeWalker* walker, IUIAutomationElement* element, int depth,
+                    int& budget, const std::function<bool(IUIAutomationElement*, int)>& visitor) {
+    if (!walker || !element || depth > 30 || budget-- <= 0) return false;
+    if (visitor(element, depth)) return true;
+    ComPtr<IUIAutomationElement> child;
+    walker->GetFirstChildElement(element, &child);
+    while (child) {
+        if (WalkRaw(walker, child.Get(), depth + 1, budget, visitor)) return true;
+        ComPtr<IUIAutomationElement> next;
+        walker->GetNextSiblingElement(child.Get(), &next);
+        child = next;
+    }
+    return false;
+}
+
+inline ComPtr<IUIAutomationTreeWalker> RawWalker(IUIAutomation* automation) {
+    ComPtr<IUIAutomationTreeWalker> walker;
+    automation->get_RawViewWalker(&walker);
+    return walker;
+}
+
+inline ComPtr<IUIAutomationElement> CloneElement(IUIAutomationElement* element) {
+    ComPtr<IUIAutomationElement> copy;
+    if (element) element->QueryInterface(IID_PPV_ARGS(&copy));
+    return copy;
+}
+
+inline ComPtr<IUIAutomationElement> FindByAutomationId(IUIAutomation* automation,
+                                                       IUIAutomationElement* root,
+                                                       const wchar_t* automationId) {
+    auto walker = RawWalker(automation);
+    ComPtr<IUIAutomationElement> found;
+    int budget = 4000;
+    WalkRaw(walker.Get(), root, 0, budget, [&](IUIAutomationElement* element, int) {
+        if (ElementAutomationId(element) != automationId) return false;
+        found = CloneElement(element);
+        return true;
+    });
+    return found;
+}
+
+inline void WakeUpPageAccessibility(IUIAutomation* automation, HWND window) {
+    HWND render = FindWindowExW(window, nullptr, L"Chrome_RenderWidgetHostHWND", nullptr);
+    if (!render) render = FindWindowExW(window, nullptr, L"Chrome Legacy Window", nullptr);
+    if (!render) return;
+    ComPtr<IAccessible> accessible;
+    AccessibleObjectFromWindow(render, static_cast<DWORD>(OBJID_CLIENT), IID_PPV_ARGS(&accessible));
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        ComPtr<IUIAutomationElement> element;
+        if (SUCCEEDED(automation->ElementFromHandle(render, &element)) && element) {
+            auto walker = RawWalker(automation);
+            int budget = 6000;
+            int visited = 0;
+            WalkRaw(walker.Get(), element.Get(), 0, budget,
+                    [&](IUIAutomationElement*, int) { ++visited; return false; });
+            if (visited > 200) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+}
+
+// 卸载器是独立进程，进来时 COM 还没初始化，而 UI Automation 的 COM 对象必须先
+// 初始化才拿得到（漏掉的话 CoCreateInstance 直接失败，两个浏览器全被记成移除失败）。
+class ComScope {
+public:
+    ComScope() : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ComScope() { if (SUCCEEDED(result_)) CoUninitialize(); }
+    ComScope(const ComScope&) = delete;
+    ComScope& operator=(const ComScope&) = delete;
+private:
+    HRESULT result_;
+};
+
+
+inline void OpenExtensionPageForBrowser(const std::wstring& browser) {
+    const fs::path executable = FindBrowser(browser);
+    if (!executable.empty()) {
+        OpenExtensionPage(browser, executable);
+    }
+}
+
 inline void InstallBrowserExtension(
     const std::wstring& browser, const fs::path& executable, const fs::path& extensionDir,
     const BrowserPoints& points, const std::function<void(const std::wstring&)>& progress) {
@@ -697,6 +856,7 @@ inline void InstallBrowserExtension(
     ComPtr<IUIAutomationElement> root;
     Check(SUCCEEDED(automation->ElementFromHandle(window, &root)) && root,
           L"无法读取浏览器 UI Automation 树");
+    WakeUpPageAccessibility(automation.Get(), window);
     const std::vector<std::wstring> developerNames{
         L"开发者模式", L"开发人员模式", L"Developer mode"};
     const std::vector<std::wstring> loadNames{
